@@ -1,0 +1,526 @@
+#!/usr/bin/env python
+# --------------------------------------------------------------
+#  Benchmark – fine‑tune a tiny GPT‑2 model on the ELI5 dataset
+#
+#  Required: torch, transformers, datasets
+#  Optional: psutil (for CPU % in table)
+#            tabulate (for pretty table formatting)
+# --------------------------------------------------------------
+
+import argparse
+import os
+import math
+import time
+import warnings
+import threading
+from collections import namedtuple
+from typing import List, Dict
+
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    DataCollatorForLanguageModeling,
+    TrainingArguments,
+    Trainer,
+)
+
+# --------------------------------------------------------------
+#  Optional pretty‑table printer
+# --------------------------------------------------------------
+try:
+    from tabulate import tabulate
+except Exception:          # pragma: no cover
+    tabulate = None
+
+# --------------------------------------------------------------
+#  Silence irrelevant warnings
+# --------------------------------------------------------------
+warnings.filterwarnings(
+    "ignore",
+    message="loss_type=None was set in the config but it is unrecognised.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module="torch.cuda",
+)
+
+# --------------------------------------------------------------
+#  Load a *small* slice of the ELI5 dataset.
+# --------------------------------------------------------------
+def load_small_eli5(num_examples: int = 200, test_frac: float = 0.1):
+    raw = load_dataset("dany0407/eli5_category", split=f"train[:{num_examples}]")
+    test_size = max(1, int(num_examples * test_frac))
+    split = raw.train_test_split(test_size=test_size, seed=42)
+    return split.flatten()
+
+
+# --------------------------------------------------------------
+#  Tokenisation helpers (need the global ``tokenizer`` variable)
+# --------------------------------------------------------------
+def tkn_preprocess(inputs):
+    """Tokenise a batch of answer strings."""
+    return tokenizer([" ".join(x) for x in inputs["answers.text"]])
+
+
+def organize_texts(input_dict):
+    """Chunk a flat list of token ids into ``block_size``‑long pieces."""
+    result = {}
+    for k, v in input_dict.items():
+        concat_v = sum(v, [])
+        total_len = len(concat_v)
+        if total_len >= block_size:
+            total_len = (total_len // block_size) * block_size
+        result[k] = [
+            concat_v[i: i + block_size] for i in range(0, total_len, block_size)
+        ]
+    # For causal LM the labels are a copy of the inputs
+    result["labels"] = result["input_ids"].copy()
+    return result
+
+
+# --------------------------------------------------------------
+#  Optional CPU / GPU monitoring utilities
+# --------------------------------------------------------------
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:        # pragma: no cover
+    _PSUTIL_AVAILABLE = False
+    print("Warning: psutil not available. CPU metrics will not be collected.")
+
+
+def _cpu_percent() -> float:
+    """Return current CPU utilization percentage."""
+    if not _PSUTIL_AVAILABLE:
+        return 0.0
+    return psutil.cpu_percent(interval=0.0)  # Non-blocking, returns since last call
+
+
+def _cpu_info_from_samples(samples: List[float]) -> Dict:
+    """Calculate CPU info from sampled percentages."""
+    if not _PSUTIL_AVAILABLE or not samples:
+        return {"total_logical": None, "sys_cpu_pct": None, "cores_used": None}
+
+    total_logical = psutil.cpu_count(logical=True) or 1
+    avg_pct = sum(samples) / len(samples)  # Average across all samples
+    cores_used = avg_pct / 100.0 * total_logical
+
+    return {
+        "total_logical": total_logical,
+        "sys_cpu_pct": avg_pct,
+        "cores_used": cores_used,
+    }
+
+
+def _gpu_utilization() -> List[float]:
+    """Return utilisation % for each visible GPU."""
+    if not torch.cuda.is_available():
+        return []
+    utils = []
+    for i in range(torch.cuda.device_count()):
+        try:
+            import pynvml
+            if not hasattr(_gpu_utilization, "_init"):
+                pynvml.nvmlInit()
+                _gpu_utilization._init = True
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            utils.append(float(util.gpu))
+        except Exception:                           # pragma: no cover
+            # Fallback: use 0.0 instead of conflating with memory
+            utils.append(0.0)
+    return utils
+
+
+def _gpu_memory_used() -> List[int]:
+    """Return memory used (MiB) for each visible GPU."""
+    if not torch.cuda.is_available():
+        return []
+    mem = []
+    for i in range(torch.cuda.device_count()):
+        try:
+            mem_bytes = torch.cuda.memory_allocated(i)
+            mem.append(int(mem_bytes / (1024 * 1024)))
+        except Exception:
+            mem.append(0)
+    return mem
+
+
+def _gpu_peak_memory() -> List[int]:
+    """Return peak memory (MiB) for each visible GPU since last reset."""
+    if not torch.cuda.is_available():
+        return []
+    mem = []
+    for i in range(torch.cuda.device_count()):
+        try:
+            mem_bytes = torch.cuda.max_memory_allocated(i)
+            mem.append(int(mem_bytes / (1024 * 1024)))
+        except Exception:
+            mem.append(0)
+    return mem
+
+
+def _used_gpu_indices(mem_list: List[int]) -> List[int]:
+    """Return GPU indices that have >0 MiB allocated."""
+    return [i for i, m in enumerate(mem_list) if m > 0]
+
+
+# --------------------------------------------------------------
+#  Stage timer – records wall‑clock time + optional resource usage
+# --------------------------------------------------------------
+class StageTimer:
+    """
+    Context manager that measures elapsed wall‑clock time and (optionally)
+    CPU / GPU utilisation and GPU peak memory. Used when ``--no-instrument`` is *not*
+    supplied.
+    """
+    def __init__(self, name: str, records: List[Dict], monitor_resources: bool = True):
+        self.name = name
+        self.records = records
+        self.monitor_resources = monitor_resources
+        self._stop_event = threading.Event()
+        self._gpu_samples: List[List[float]] = []
+        self._gpu_mem_samples: List[List[int]] = []
+        self._cpu_samples: List[float] = []
+
+    # ------------------------------------------------------------------
+    # background thread that samples GPU utilisation, memory, and CPU every 0.1 s
+    # ------------------------------------------------------------------
+    def _resource_sampler(self):
+        # Initialize CPU monitoring with a blocking call
+        if _PSUTIL_AVAILABLE:
+            psutil.cpu_percent(interval=None)  # Initialize, ignore first value
+
+        while not self._stop_event.is_set():
+            # Sample GPU if available
+            if torch.cuda.is_available():
+                self._gpu_samples.append(_gpu_utilization())
+                self._gpu_mem_samples.append(_gpu_memory_used())
+
+            # Sample CPU if available
+            if _PSUTIL_AVAILABLE:
+                self._cpu_samples.append(_cpu_percent())
+
+            time.sleep(0.1)
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+
+        # Reset peak memory stats at the start of each stage (only if CUDA is available)
+        if self.monitor_resources and torch.cuda.is_available():
+            try:
+                for i in range(torch.cuda.device_count()):
+                    torch.cuda.reset_peak_memory_stats(i)
+            except Exception:
+                pass  # Silently ignore if reset fails
+
+        # Start background sampling thread
+        if self.monitor_resources:
+            self._sampler_thread = threading.Thread(
+                target=self._resource_sampler, daemon=True
+            )
+            self._sampler_thread.start()
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.elapsed = time.perf_counter() - self.start
+
+        gpu_pct = None
+        gpu_mem = None
+        gpu_peak_mem = None
+        used_gpu_idxs = []
+        cpu_info = {}
+
+        if self.monitor_resources:
+            # Stop sampling thread
+            self._stop_event.set()
+            if hasattr(self, "_sampler_thread"):
+                self._sampler_thread.join()
+
+            # Process GPU samples
+            if torch.cuda.is_available():
+                # Average GPU utilization across samples
+                if self._gpu_samples:
+                    transposed = list(zip(*self._gpu_samples))
+                    gpu_pct = [sum(col) / len(col) for col in transposed]
+
+                # Peak memory from PyTorch's built-in tracker
+                gpu_peak_mem = _gpu_peak_memory()
+
+                # Also track peak from our samples for comparison
+                if self._gpu_mem_samples:
+                    transposed_mem = list(zip(*self._gpu_mem_samples))
+                    sampled_peak = [max(col) if col else 0 for col in transposed_mem]
+                    # Use the maximum of PyTorch peak and sampled peak
+                    if gpu_peak_mem:
+                        gpu_mem = [max(a, b) for a, b in zip(gpu_peak_mem, sampled_peak)]
+                    else:
+                        gpu_mem = sampled_peak
+                else:
+                    gpu_mem = gpu_peak_mem
+
+                used_gpu_idxs = _used_gpu_indices(gpu_mem or [])
+
+            # Process CPU samples
+            cpu_info = _cpu_info_from_samples(self._cpu_samples)
+
+        self.records.append({
+            "stage": self.name,
+            "time_s": self.elapsed,
+            "sys_cpu_pct": cpu_info.get("sys_cpu_pct"),
+            "cores_used": cpu_info.get("cores_used"),
+            "gpu_pct": gpu_pct,
+            "gpu_mem_mib": gpu_mem,
+            "used_gpu_idxs": used_gpu_idxs,
+        })
+
+
+# --------------------------------------------------------------
+#  No‑op timer – used when ``--no-instrument`` is set
+# --------------------------------------------------------------
+class NoOpTimer:
+    """Context‑manager that does nothing – used when instrumentation is disabled."""
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+# Named tuple for benchmark results
+BenchmarkResult = namedtuple('BenchmarkResult', ['perplexity', 'elapsed_time'])
+
+def parse_clm(args):
+    parser = argparse.ArgumentParser(
+    description=(
+            "Benchmark a tiny GPT‑2 fine‑tuning run on the ELI5 dataset. "
+            "Use --cpu-only to force CPU‑only, --no-instrument to skip per‑stage "
+            "resource measurement."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Force the whole pipeline onto the CPU (disables CUDA).",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=200,
+        help="Number of raw ELI5 examples to load (default: 200).",
+    )
+    parser.add_argument(
+        "--no-instrument",
+        action="store_true",
+        help="Disable per‑stage instrumentation – only total runtime will be printed.",
+    )
+    return parser.parse_args(args)
+
+
+def main(args=None):
+    args = parse_clm(args)
+    # --------------------------------------------------------------
+    # Choose timer implementation
+    # --------------------------------------------------------------
+    TimerClass = NoOpTimer if args.no_instrument else StageTimer
+
+    # --------------------------------------------------------------
+    # Container for timing data
+    # --------------------------------------------------------------
+    records: List[Dict] = []
+
+    global tokenizer, block_size
+
+    # --------------------------------------------------------------
+    # Overall wall‑clock start
+    # --------------------------------------------------------------
+    overall_start = time.perf_counter()
+
+    # --------------------------------------------------------------
+    # System info
+    # --------------------------------------------------------------
+    print("\n=== System resources ===")
+    print(f"Available CPUs : {os.cpu_count()}")
+    if args.cpu_only:
+        print("Running in CPU-only mode")
+    else:
+        print(f"Available GPUs : {torch.cuda.device_count()}")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                print(
+                    f"GPU {i}: {props.name} ({props.total_memory / (1024**3):.2f} GB)"
+                )
+    print("=" * 50 + "\n")
+
+    # --------------------------------------------------------------
+    # Load dataset
+    # --------------------------------------------------------------
+    with TimerClass("load_dataset", records):
+        eli5 = load_small_eli5(num_examples=args.samples, test_frac=0.1)
+
+    # --------------------------------------------------------------
+    # Tokenizer creation
+    # --------------------------------------------------------------
+    with TimerClass("create_tokenizer", records):
+        tokenizer = AutoTokenizer.from_pretrained("distilbert/distilgpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # --------------------------------------------------------------
+    # Tokenise the dataset
+    # --------------------------------------------------------------
+    with TimerClass("tokenise", records):
+        tokenized_eli5 = eli5.map(
+            tkn_preprocess,
+            batched=True,
+            num_proc=4,
+            remove_columns=eli5["train"].column_names,
+        )
+
+    # --------------------------------------------------------------
+    # Chunk token streams into fixed‑size blocks
+    # --------------------------------------------------------------
+    block_size = 128
+    with TimerClass("blockify", records):
+        eli5_dataset = tokenized_eli5.map(
+            organize_texts, batched=True, num_proc=4
+        )
+
+    # --------------------------------------------------------------
+    # Load the model & move to the appropriate device
+    # --------------------------------------------------------------
+    with TimerClass("load_model", records):
+        model = AutoModelForCausalLM.from_pretrained("distilbert/distilgpt2")
+        device = torch.device("cpu")
+        if not args.cpu_only and torch.cuda.is_available():
+            device = torch.device("cuda")
+        model.to(device)
+
+    # --------------------------------------------------------------
+    # Data collator
+    # --------------------------------------------------------------
+    with TimerClass("create_collator", records):
+        data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+
+    # --------------------------------------------------------------
+    # TrainingArguments
+    # --------------------------------------------------------------
+    with TimerClass("training_args", records):
+        training_args = TrainingArguments(
+            output_dir="clm-example-model",
+            eval_strategy="epoch",
+            learning_rate=2e-5,
+            weight_decay=0.01,
+            push_to_hub=False,
+            save_strategy="no",
+            use_cpu=args.cpu_only,
+        )
+
+    # --------------------------------------------------------------
+    # Trainer construction
+    # --------------------------------------------------------------
+    with TimerClass("create_trainer", records):
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=eli5_dataset["train"],
+            eval_dataset=eli5_dataset["test"],
+            data_collator=data_collator,
+            tokenizer=tokenizer,          # needed for correct padding handling
+        )
+
+    # --------------------------------------------------------------
+    # Train
+    # --------------------------------------------------------------
+    with TimerClass("train", records):
+        trainer.train()
+
+    # --------------------------------------------------------------
+    # Evaluate
+    # --------------------------------------------------------------
+    with TimerClass("evaluate", records):
+        eval_results = trainer.evaluate()
+        perplexity = math.exp(eval_results["eval_loss"])
+        print(f"\n=== Final Perplexity: {perplexity:.2f} ===\n")
+
+    # --------------------------------------------------------------
+    # Overall wall‑clock end
+    # --------------------------------------------------------------
+    overall_end = time.perf_counter()
+    total_elapsed = overall_end - overall_start
+
+    # --------------------------------------------------------------
+    # Benchmark summary (per‑stage)
+    # --------------------------------------------------------------
+    if not args.no_instrument and records:
+        # Check if any GPU was actually used
+        all_used = set()
+        for r in records:
+            all_used.update(r.get("used_gpu_idxs", []))
+        used_ordered = sorted(all_used)
+
+        if used_ordered:
+            print("\n=== Benchmark Summary (GPU memory shows PEAK) ===\n")
+        else:
+            print("\n=== Benchmark Summary (CPU-only mode) ===\n")
+
+        # Header
+        headers = ["Stage", "Time (s)", "CPU %", "Cores Used"]
+        for i in used_ordered:
+            headers += [f"GPU {i} %", f"GPU {i} Peak (MiB)"]
+
+        rows = []
+        for r in records:
+            row = [
+                r["stage"],
+                f"{r['time_s']:.2f}",
+                f"{r['sys_cpu_pct']:.1f}"
+                if r.get("sys_cpu_pct") is not None else "-",
+                f"{r['cores_used']:.1f}"
+                if r.get("cores_used") is not None else "-",
+            ]
+
+            gpu_pct = r.get("gpu_pct") or []
+            gpu_mem = r.get("gpu_mem_mib") or []
+            for i in used_ordered:
+                pct = gpu_pct[i] if i < len(gpu_pct) else None
+                mem = gpu_mem[i] if i < len(gpu_mem) else None
+                row.append(f"{pct:.1f}" if pct is not None else "-")
+                row.append(str(mem) if mem is not None else "-")
+            rows.append(row)
+
+        # TOTAL line
+        total_time = sum(r["time_s"] for r in records)
+        total_row = ["TOTAL", f"{total_time:.2f}"] + ["-"] * (len(headers) - 2)
+        rows.append(total_row)
+
+        if tabulate:
+            print(tabulate(rows, headers=headers, tablefmt="github"))
+        else:
+            # very simple fallback formatting
+            col_widths = [
+                max(len(str(v)) for v in col) for col in zip(*([headers] + rows))
+            ]
+            fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+            print(fmt.format(*headers))
+            print("-" * (sum(col_widths) + 2 * (len(col_widths) - 1)))
+            for row in rows:
+                print(fmt.format(*row))
+        print("\n" + "=" * 50)
+
+    else:
+        print("\n=== Total Runtime ===")
+        print(f"{total_elapsed:.2f} seconds")
+    return BenchmarkResult(perplexity=perplexity, elapsed_time=total_elapsed)
+
+
+if __name__ == "__main__":
+    main()
