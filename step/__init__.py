@@ -14,15 +14,22 @@ import threading
 from typing import Any, Callable
 
 from .ir import (
+    AccumOp,
     BinaryMapOp,
+    BufferizeOp,
+    FlattenOp,
     IRNode,
     StepGraph,
+    StreamifyOp,
     StreamToTensor,
     TensorToStream,
     UnaryMapOp,
     reset_id_counter,
 )
 from .lambda_parser import parse_lambda
+
+# Sentinel: "entire dimension, no tiling"
+FULL = -1
 
 # ---------------------------------------------------------------------------
 # Thread-local tracing context
@@ -74,17 +81,43 @@ class StreamProxy:
         return self._node
 
 
+class _SymbolicShape:
+    """Symbolic shape that returns FULL for any dimension index."""
+
+    def __init__(self, ndim: int):
+        self._ndim = ndim
+
+    def __getitem__(self, idx: int):
+        return FULL
+
+    def __len__(self):
+        return self._ndim
+
+
 class TensorProxy:
     """Proxy standing in for a tensor parameter during tracing."""
 
-    def __init__(self, name: str, ndim: int):
+    def __init__(self, name: str, ndim: int, transforms: list | None = None):
         self.name = name
         self.ndim = ndim
+        self.transforms: list = transforms if transforms is not None else []
 
-    # Allow math.sqrt etc. to run on real values — this proxy is only for
-    # tracking tensor parameters, not for intercepting scalar operations.
+    @property
+    def T(self) -> "TensorProxy":
+        return TensorProxy(self.name, self.ndim, self.transforms + [("T",)])
+
+    def contiguous(self) -> "TensorProxy":
+        return TensorProxy(self.name, self.ndim, self.transforms + [("contiguous",)])
+
+    def unsqueeze(self, dim: int) -> "TensorProxy":
+        return TensorProxy(self.name, self.ndim + 1, self.transforms + [("unsqueeze", dim)])
+
+    @property
+    def shape(self) -> _SymbolicShape:
+        return _SymbolicShape(self.ndim)
+
     def size(self, dim: int | None = None):
-        raise RuntimeError("TensorProxy.size() not supported during tracing")
+        return FULL
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +137,12 @@ def tensor_to_stream(tensor, vec: list[int]) -> StreamProxy:
     if isinstance(tensor, TensorProxy):
         param_name = tensor.name
         ndim = tensor.ndim
+        transforms = tensor.transforms
     else:
         raise TypeError(f"Expected TensorProxy during tracing, got {type(tensor).__name__}")
 
     node = TensorToStream(tensor_param=param_name, vec=vec, tensor_ndim=ndim)
+    node.transforms = list(transforms)
     graph.add_node(node)
     return StreamProxy(node)
 
@@ -196,6 +231,56 @@ def BinaryMap(stream1: StreamProxy, stream2: StreamProxy, func: Callable) -> Str
     return StreamProxy(node)
 
 
+def Flatten(stream: StreamProxy, min_rank: int, max_rank: int) -> StreamProxy:
+    """Flatten stream dimensions [min_rank, max_rank) into one."""
+    if not _is_tracing():
+        raise RuntimeError("Flatten() can only be called during tracing.")
+    graph = _get_graph()
+    if not isinstance(stream, StreamProxy):
+        raise TypeError(f"Expected StreamProxy, got {type(stream).__name__}")
+    node = FlattenOp(input_node=stream.node, min_rank=min_rank, max_rank=max_rank)
+    graph.add_node(node)
+    return StreamProxy(node)
+
+
+def Bufferize(stream: StreamProxy, rank: int) -> StreamProxy:
+    """Materialize a stream into a buffer for reuse."""
+    if not _is_tracing():
+        raise RuntimeError("Bufferize() can only be called during tracing.")
+    graph = _get_graph()
+    if not isinstance(stream, StreamProxy):
+        raise TypeError(f"Expected StreamProxy, got {type(stream).__name__}")
+    buf_id = graph._next_buffer_id
+    graph._next_buffer_id += 1
+    node = BufferizeOp(input_node=stream.node, rank=rank, buffer_id=buf_id)
+    graph.add_node(node)
+    return StreamProxy(node)
+
+
+def Streamify(buffer: StreamProxy, repeat_factor: list[int], rank: int) -> StreamProxy:
+    """Replay a buffered stream with repetition."""
+    if not _is_tracing():
+        raise RuntimeError("Streamify() can only be called during tracing.")
+    graph = _get_graph()
+    if not isinstance(buffer, StreamProxy):
+        raise TypeError(f"Expected StreamProxy, got {type(buffer).__name__}")
+    node = StreamifyOp(input_node=buffer.node, repeat_factor=repeat_factor, rank=rank)
+    graph.add_node(node)
+    return StreamProxy(node)
+
+
+def Accum(stream: StreamProxy, rank: int) -> StreamProxy:
+    """Accumulate (reduce) over innermost stream dimensions."""
+    if not _is_tracing():
+        raise RuntimeError("Accum() can only be called during tracing.")
+    graph = _get_graph()
+    if not isinstance(stream, StreamProxy):
+        raise TypeError(f"Expected StreamProxy, got {type(stream).__name__}")
+    node = AccumOp(input_node=stream.node, rank=rank)
+    graph.add_node(node)
+    return StreamProxy(node)
+
+
 # ---------------------------------------------------------------------------
 # cpu_compile — trace and compile
 # ---------------------------------------------------------------------------
@@ -224,9 +309,15 @@ def cpu_compile(func: Callable) -> Callable:
     _trace_ctx.name_counter = {}
 
     try:
-        # Call func with proxy objects
-        # Assume all parameters are 2D tensors (v1 limitation)
-        proxies = [TensorProxy(name=p, ndim=2) for p in tensor_params]
+        # Call func with proxy objects.
+        # Infer ndim from parameter annotations or hints if available,
+        # otherwise default to 2D. The function may call .unsqueeze() etc.
+        # which updates the proxy's ndim dynamically.
+        ndim_hints = getattr(func, '_param_ndims', None)
+        proxies = []
+        for i, p in enumerate(tensor_params):
+            nd = ndim_hints[i] if ndim_hints else 2
+            proxies.append(TensorProxy(name=p, ndim=nd))
         func(*proxies)
     finally:
         _trace_ctx.graph = None

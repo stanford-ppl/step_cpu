@@ -18,6 +18,7 @@ _TORCH_FUNC_MAP: dict[str, str] = {
     "sigmoid": "torch::sigmoid",
     "relu": "torch::relu",
     "clamp": "torch::clamp",
+    "mm": "torch::mm",
 }
 
 # Python operator AST node -> C++ operator string
@@ -88,6 +89,12 @@ class LambdaTranslator(ast.NodeVisitor):
         operand = self.visit(node.operand)
         return f"({op_str}{operand})"
 
+    def visit_Attribute(self, node: ast.Attribute) -> str:
+        obj = self.visit(node.value)
+        if node.attr == "T":
+            return f"{obj}.t()"
+        raise ValueError(f"Unsupported attribute access: .{node.attr}")
+
     def visit_Call(self, node: ast.Call) -> str:
         func_name = _extract_func_name(node.func)
         if func_name is None:
@@ -136,10 +143,28 @@ def parse_lambda(func, param_to_cpp: dict[str, str] | None = None) -> tuple[ast.
     # The lambda may be embedded in a larger expression (e.g., UnaryMap(x, lambda a: ...))
     # or in an assignment (func = lambda a: ...).  Always try exec mode first since
     # it handles both statements and expressions.
-    try:
+    # When a lambda spans continuation lines, inspect.getsource may return only
+    # the lambda line with trailing unmatched parentheses — progressively strip them.
+    tree = None
+    for _ in range(10):
+        try:
+            tree = ast.parse(source, mode="exec")
+            break
+        except SyntaxError:
+            pass
+        try:
+            tree = ast.parse(source, mode="eval")
+            break
+        except SyntaxError:
+            pass
+        # Strip one trailing paren/comma and retry
+        stripped = source.rstrip()
+        if stripped and stripped[-1] in ")],":
+            source = stripped[:-1]
+        else:
+            break
+    if tree is None:
         tree = ast.parse(source, mode="exec")
-    except SyntaxError:
-        tree = ast.parse(source, mode="eval")
     lambda_node = _find_lambda(tree)
     if lambda_node is None:
         raise ValueError(f"Could not find lambda in source: {source!r}")

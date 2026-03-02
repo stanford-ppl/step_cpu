@@ -113,6 +113,49 @@ class BinaryMapOp(IRNode):
         input_node2.users.append(self)
 
 
+class FlattenOp(IRNode):
+    """Logical reshape: merge stream dimensions. CPU no-op."""
+
+    def __init__(self, input_node: IRNode, min_rank: int, max_rank: int):
+        super().__init__(name=f"flat_{input_node.name}", stream_shape=input_node.stream_shape)
+        self.input_node: IRNode = input_node
+        self.min_rank: int = min_rank
+        self.max_rank: int = max_rank
+        input_node.users.append(self)
+
+
+class BufferizeOp(IRNode):
+    """Materialization boundary: collect a stream into a buffer."""
+
+    def __init__(self, input_node: IRNode, rank: int, buffer_id: int = 0):
+        super().__init__(name=f"buf_{buffer_id}", stream_shape=input_node.stream_shape)
+        self.input_node: IRNode = input_node
+        self.rank: int = rank
+        self.buffer_id: int = buffer_id
+        input_node.users.append(self)
+
+
+class StreamifyOp(IRNode):
+    """Replay boundary: replay a buffered stream with repetition."""
+
+    def __init__(self, input_node: IRNode, repeat_factor: list[int], rank: int):
+        super().__init__(name=f"stfy_{input_node.name}", stream_shape=input_node.stream_shape)
+        self.input_node: IRNode = input_node
+        self.repeat_factor: list[int] = list(repeat_factor)
+        self.rank: int = rank
+        input_node.users.append(self)
+
+
+class AccumOp(IRNode):
+    """Reduction over innermost stream dimensions."""
+
+    def __init__(self, input_node: IRNode, rank: int):
+        super().__init__(name=f"acc_{input_node.name}", stream_shape=input_node.stream_shape)
+        self.input_node: IRNode = input_node
+        self.rank: int = rank
+        input_node.users.append(self)
+
+
 class ConstantNode(IRNode):
     """A captured scalar constant."""
 
@@ -130,6 +173,8 @@ class StepGraph:
         self.nodes: list[IRNode] = []
         self.sources: list[TensorToStream] = []
         self.sinks: list[StreamToTensor] = []
+        self.buffers: list[BufferizeOp] = []
+        self._next_buffer_id: int = 0
 
     def add_node(self, node: IRNode) -> IRNode:
         self.nodes.append(node)
@@ -137,6 +182,8 @@ class StepGraph:
             self.sources.append(node)
         elif isinstance(node, StreamToTensor):
             self.sinks.append(node)
+        elif isinstance(node, BufferizeOp):
+            self.buffers.append(node)
         return node
 
     def topo_sort(self) -> list[IRNode]:
@@ -155,6 +202,14 @@ class StepGraph:
                 visit(node.input_node1)
                 visit(node.input_node2)
             elif isinstance(node, StreamToTensor):
+                visit(node.input_node)
+            elif isinstance(node, FlattenOp):
+                visit(node.input_node)
+            elif isinstance(node, BufferizeOp):
+                visit(node.input_node)
+            elif isinstance(node, StreamifyOp):
+                visit(node.input_node)
+            elif isinstance(node, AccumOp):
                 visit(node.input_node)
             order.append(node)
 
