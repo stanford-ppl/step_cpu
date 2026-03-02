@@ -333,6 +333,29 @@ def parse_clm(args):
         action="store_true",
         help="Disable per‑stage instrumentation – only total runtime will be printed.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["train", "infer"],
+        default="train",
+        help="Run training ('train') or inference ('infer'). Default: train.",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Input prompt for inference mode (required when --mode infer).",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="clm-example-model",
+        help=(
+            "Path to a fine‑tuned model directory. In inference mode the script "
+            "will try this path first and fall back to the base distilgpt2. "
+            "In training mode the model is saved here after training. "
+            "(default: clm-example-model)"
+        ),
+    )
     return parser.parse_args(args)
 
 
@@ -371,6 +394,117 @@ def main(args=None):
                     f"GPU {i}: {props.name} ({props.total_memory / (1024**3):.2f} GB)"
                 )
     print("=" * 50 + "\n")
+
+    # --------------------------------------------------------------
+    # Inference mode
+    # --------------------------------------------------------------
+    if args.mode == "infer":
+        if args.prompt is None:
+            print("Error: --prompt is required when --mode infer")
+            return BenchmarkResult(perplexity=None, elapsed_time=0.0)
+
+        # Try to load fine‑tuned weights; fall back to the base model.
+        use_finetuned = os.path.isdir(args.model_path) and os.path.isfile(
+            os.path.join(args.model_path, "config.json")
+        )
+        model_id = args.model_path if use_finetuned else "distilbert/distilgpt2"
+
+        if use_finetuned:
+            print(f"Loading fine‑tuned model from {args.model_path}")
+        else:
+            print("No fine‑tuned model found — using base distilgpt2")
+
+        with TimerClass("create_tokenizer", records):
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            tokenizer.pad_token = tokenizer.eos_token
+
+        with TimerClass("load_model", records):
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+            device = torch.device("cpu")
+            if not args.cpu_only and torch.cuda.is_available():
+                device = torch.device("cuda")
+            model.to(device)
+
+        with TimerClass("tokenize_prompt", records):
+            inputs = tokenizer(args.prompt, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with TimerClass("generate", records):
+            model.eval()
+            with torch.no_grad():
+                output_ids = model.generate(
+                    inputs["input_ids"],
+                    max_new_tokens=20,
+                    do_sample=False,
+                )
+            generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        print(f"\n=== Generated Text ===\n{generated_text}\n")
+
+        overall_end = time.perf_counter()
+        total_elapsed = overall_end - overall_start
+
+        if not args.no_instrument and records:
+            all_used = set()
+            for r in records:
+                all_used.update(r.get("used_gpu_idxs", []))
+            used_ordered = sorted(all_used)
+
+            if used_ordered:
+                print("\n=== Benchmark Summary (GPU memory shows PEAK) ===\n")
+            else:
+                print("\n=== Benchmark Summary (CPU-only mode) ===\n")
+
+            headers = ["Stage", "Time (s)", "CPU %", "Cores Used"]
+            for i in used_ordered:
+                headers += [f"GPU {i} %", f"GPU {i} Peak (MiB)"]
+
+            rows = []
+            for r in records:
+                row = [
+                    r["stage"],
+                    f"{r['time_s']:.2f}",
+                    (
+                        f"{r['sys_cpu_pct']:.1f}"
+                        if r.get("sys_cpu_pct") is not None
+                        else "-"
+                    ),
+                    (
+                        f"{r['cores_used']:.1f}"
+                        if r.get("cores_used") is not None
+                        else "-"
+                    ),
+                ]
+                gpu_pct = r.get("gpu_pct") or []
+                gpu_mem = r.get("gpu_mem_mib") or []
+                for i in used_ordered:
+                    pct = gpu_pct[i] if i < len(gpu_pct) else None
+                    mem = gpu_mem[i] if i < len(gpu_mem) else None
+                    row.append(f"{pct:.1f}" if pct is not None else "-")
+                    row.append(str(mem) if mem is not None else "-")
+                rows.append(row)
+
+            total_time = sum(r["time_s"] for r in records)
+            total_row = ["TOTAL", f"{total_time:.2f}"] + ["-"] * (len(headers) - 2)
+            rows.append(total_row)
+
+            if tabulate:
+                print(tabulate(rows, headers=headers, tablefmt="github"))
+            else:
+                col_widths = [
+                    max(len(str(v)) for v in col) for col in zip(*([headers] + rows))
+                ]
+                fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+                print(fmt.format(*headers))
+                print("-" * (sum(col_widths) + 2 * (len(col_widths) - 1)))
+                for row in rows:
+                    print(fmt.format(*row))
+            print("\n" + "=" * 50)
+        else:
+            print("\n=== Total Runtime ===")
+            print(f"{total_elapsed:.2f} seconds")
+
+        return BenchmarkResult(perplexity=None, elapsed_time=total_elapsed)
 
     # --------------------------------------------------------------
     # Load dataset
@@ -443,7 +577,7 @@ def main(args=None):
             train_dataset=eli5_dataset["train"],
             eval_dataset=eli5_dataset["test"],
             data_collator=data_collator,
-            tokenizer=tokenizer,  # needed for correct padding handling
+            processing_class=tokenizer,  # needed for correct padding handling
         )
 
     # --------------------------------------------------------------
@@ -451,6 +585,14 @@ def main(args=None):
     # --------------------------------------------------------------
     with TimerClass("train", records):
         trainer.train()
+
+    # --------------------------------------------------------------
+    # Save fine‑tuned model
+    # --------------------------------------------------------------
+    with TimerClass("save_model", records):
+        model.save_pretrained(args.model_path)
+        tokenizer.save_pretrained(args.model_path)
+        print(f"\n=== Model saved to {args.model_path} ===")
 
     # --------------------------------------------------------------
     # Evaluate
