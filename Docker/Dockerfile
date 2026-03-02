@@ -1,0 +1,302 @@
+# CPU-only variant (keep everything else as close as possible)
+
+FROM ubuntu:24.04
+
+SHELL ["/bin/bash", "-c"]
+
+# run apt update
+# install libstdc++ that code will link against
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y \
+    build-essential \
+    ca-certificates \
+    cmake \
+    ninja-build \
+    emacs \
+    git \
+    htop \
+    libgl1 \
+    libopenblas-dev \
+    libopencv-dev \
+    libstdc++-14-dev \
+    libzip-dev \
+    pkg-config \
+    python3-dev \
+    python3-venv \
+    software-properties-common \
+    sudo \
+    swig \
+    time \
+    wget
+
+#ARG CLANG_VER=16 # works
+#ARG CLANG_VER=17 # works, -Wno-unknown-warning-option
+#ARG CLANG_VER=18 # -fclang-abi-compat=17 added to CXXFLAGS & TORCH_NVCC_FLAGS
+ARG CLANG_VER=19 # -fclang-abi-compat=17 added to CXXFLAGS & TORCH_NVCC_FLAGS
+#ARG CLANG_VER=20 # "clang version must be less than 20 and greater than 3.2"
+RUN apt-get install -y \
+    clang-${CLANG_VER} && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${CLANG_VER} 100 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${CLANG_VER} 100 && \
+    update-alternatives --install /usr/bin/llvm-ar llvm-ar  /usr/bin/llvm-ar-${CLANG_VER} 100 && \
+    update-alternatives --install /usr/bin/llvm-profdata llvm-profdata  /usr/bin/llvm-profdata-${CLANG_VER} 100 && \
+    apt-get install -y libomp-${CLANG_VER}-dev
+
+# set up a user
+RUN useradd -l -ms /bin/bash dockeruser && \
+    echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
+    adduser dockeruser sudo
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN echo 'dockeruser:dockeruser' | chpasswd
+USER dockeruser
+ARG DOCKERUSERHOME=/home/dockeruser
+WORKDIR ${DOCKERUSERHOME}
+
+# get pytorch
+#ARG PT_VER=2.9.1
+#ARG PTHASH=d38164a545b4a4e4e0cf73ce67173f70574890b6
+ARG PT_VER=2.8.0
+ARG PTHASH=ba56102387ef21a3b04b357e5b183d48f0afefc7
+RUN python3 -m venv mochaenv && \
+    source mochaenv/bin/activate && \
+    pip install --upgrade pip && \
+    git clone https://github.com/pytorch/pytorch && \
+    cd pytorch && \
+    git checkout ${PTHASH} -b ${PT_VER} && \
+    git submodule sync && \
+    git submodule update --init --recursive
+
+# set compiler and flags to link libstdc++ here
+# need a new ENV to use definitions
+ENV CC=/usr/bin/clang \
+    CXX=/usr/bin/clang++ \
+    GXX_INC=/usr/include/c++/14 \
+    LLVM_INC=/usr/lib/llvm-${CLANG_VER}/lib/clang/${CLANG_VER}/include \
+    GXX_LIB=/usr/lib/gcc/x86_64-linux-gnu/14 \
+    LLVM_LIB=/usr/lib/llvm-${CLANG_VER}/lib
+ENV CXXFLAGS="-fclang-abi-compat=17 -Wno-unknown-warning-option -stdlib=libstdc\+\+ -I${GXX_INC} -I${LLVM_INC}" \
+    LDFLAGS="-stdlib=libstdc\+\+ -L${GXX_LIB} -Wl,-rpath,${GXX_LIB} -L${LLVM_LIB} -Wl,-rpath,${LLVM_LIB}"
+
+# -----------------------------------------------------------------------------
+# GPU/CUDA variables (commented out for CPU-only experiments)
+# -----------------------------------------------------------------------------
+# ENV CUDA_HOME=/usr/local/cuda \
+#     CUDA_ARCH_LIST="8.9+PTX" \
+#     CUDA_HOST_COMPILER=/usr/bin/clang++
+# ENV CUDA_NVCC_EXECUTABLE=${CUDA_HOME}/bin/nvcc \
+#     CUDA_TOOLKIT_ROOT_DIR=${CUDA_HOME} \
+#     CMAKE_CUDA_ARCHITECTURES="89;89-virtual" \
+#     CMAKE_CUDA_COMPILER=${CUDA_HOME}/bin/nvcc \
+#     CMAKE_CUDA_HOST_COMPILER=/usr/bin/clang++ \
+#     CMAKE_GENERATOR=Ninja \
+#     CMAKE_VERBOSE_MAKEFILE=1
+# ENV CUDA_ARCH_BIN=${CUDA_ARCH_LIST} \
+#     CUDA_ARCH_PTX=${CUDA_ARCH_LIST} \
+#     TORCH_CUDA_ARCH_LIST=${CUDA_ARCH_LIST} \
+#     TORCH_NVCC_FLAGS="-Xcompiler -fclang-abi-compat=17"
+
+# CPU-only build switches
+ENV BUILD_TEST=0 \
+    USE_CUDA=0 \
+    USE_CUDNN=0 \
+    USE_DISTRIBUTED=0 \
+    USE_NCCL=0 \
+    USE_NNPACK=0 \
+    USE_TENSORPIPE=0
+
+# build pytorch
+# list pip dependencies that should be built from source
+ENV PIP_NO_BINARY="numpy, \
+                   opencv-python, \
+                   torch"
+# -j$(nproc) runs out of memory. Setting NJOBS=12 peaks at about 40GB.
+ARG NJOBS=12
+RUN source mochaenv/bin/activate && \
+    cd pytorch && \
+    python3 -m pip install -r requirements.txt && \
+    python3 setup.py build --cmake-only && \
+    cd build && \
+    ninja torch_cpu c10 -j${NJOBS} && \
+    ninja -j${NJOBS} && \
+    cd .. && \
+    python3 setup.py bdist_wheel && \
+    python3 -m pip install dist/torch-${PT_VER}*.whl
+
+# use this to test in container
+# python3 -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"
+
+# some additional pip packages for benchmarking
+RUN source mochaenv/bin/activate && \
+    python3 -m pip install \
+    datasets \
+    nvidia-ml-py \
+    psutil \
+    pytest \
+    tabulate
+
+# build torchvision
+ENV PIP_NO_BINARY="${PIP_NO_BINARY}, \
+                   torchvision"
+ARG TV_VER=v0.23.0
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/pytorch/vision torchvision && \
+    cd torchvision && \
+    git checkout ${TV_VER} -b ${TV_VER} && \
+    python3 setup.py install
+
+# build ultralytics
+# NOTE: CPU-only: replace onnxruntime-gpu with onnxruntime; drop tensorrt.
+ENV PIP_NO_BINARY="${PIP_NO_BINARY}, \
+                   ultralytics"
+ARG U_VER=v8.3.228
+RUN source mochaenv/bin/activate && \
+    python3 -m pip install \
+    onnx==1.19.1 \
+    onnxruntime==1.23.2 \
+    onnxslim==0.1.78 && \
+    # tensorrt-cu12==10.1.0 (GPU-only) disabled \
+    git clone https://github.com/ultralytics/ultralytics.git && \
+    cd ultralytics && \
+    git checkout tags/${U_VER} -b ${U_VER} && \
+    python3 -m pip install -e .
+
+# build huggingface transformers
+ENV PIP_NO_BINARY="${PIP_NO_BINARY}, \
+                   transformers"
+ARG HF_VER=v4.57.1
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/huggingface/transformers.git && \
+    cd transformers && \
+    git checkout tags/${HF_VER} -b ${HF_VER} && \
+    python3 -m pip install -e .[torch]
+
+# build faiss and hnswlib
+# NOTE: CPU-only: drop cupy/cuvs/faiss-gpu; keep faiss-cpu and build FAISS without GPU.
+ENV PIP_NO_BINARY="${PIP_NO_BINARY}, \
+                   faiss-cpu, \
+                   hnswlib"
+ENV FAISS_VER=v1.13.2
+ENV HNSW_VER=v0.8.0
+RUN source mochaenv/bin/activate && \
+    python3 -m pip install -v \
+    faiss-cpu && \
+    git clone https://github.com/facebookresearch/faiss.git && \
+    cd faiss && \
+    git checkout tags/${FAISS_VER} -b ${FAISS_VER} && \
+    mkdir build && \
+    cd build && \
+    cmake . \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DFAISS_ENABLE_GPU=OFF \
+    -DFAISS_ENABLE_PYTHON=ON \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_INSTALL_PREFIX=/home/dockeruser/installs \
+    -DCMAKE_C_COMPILER=$(which clang) \
+    -DCMAKE_CXX_COMPILER=$(which clang++) \
+    -DPython_EXECUTABLE=$(which python3) \
+    -DBLA_VENDOR=OpenBLAS && \
+    ninja -j $(nproc) && \
+    ninja install && \
+    cd && \
+    git clone https://github.com/nmslib/hnswlib.git && \
+    cd hnswlib && \
+    git checkout tags/${HNSW_VER} -b ${HNSW_VER} && \
+    python3 -m pip install -v -e .
+
+# build darknet (yolov4)
+# the feature/clang branch on this fork changes gcc to clang
+# it is a few commits beyond 59596d7880f6504768df41d6daa586f5cb2b932f
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/sei-jgwohlbier/darknet.git && \
+    cd darknet && \
+    git checkout feature/clang && \
+    make && \
+    make clean && \
+    make -f Makefile_cpu && \
+    make clean && \
+    wget https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v3_optimal/yolov4.weights
+
+# build or-tools
+# hash of stable branch in Jan. 26
+ENV OR_HASH=b21a1326905a85b55cb52945716e10990a7cb3bf
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/google/or-tools.git && \
+    cd or-tools && \
+    git checkout ${OR_HASH} -b latest-stable && \
+    mkdir build && \
+    cd build && \
+    cmake \
+    -DBUILD_DEPS=ON \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_INSTALL_PREFIX=/home/dockeruser/.local \
+    ../ && \
+    ninja install
+
+# install pytorch_geometric and build external libraries
+# NOTE: torch is CPU-only, so these should build CPU extensions only.
+ENV CFLAGS="-fPIC"
+# ENV CUDAHOSTCXX=clang++  # GPU-related; not needed for CPU-only
+ENV PIP_NO_BINARY="${PIP_NO_BINARY}, \
+                   pyg-lib \
+                   pytorch_geometric \
+                   torch-cluster \
+                   torch-scatter \
+                   torch-sparse \
+                   torch-spline-conv"
+ENV PL_VER=0.5.0
+RUN source mochaenv/bin/activate && \
+    git clone --recursive https://github.com/pyg-team/pyg-lib.git && \
+    cd pyg-lib && \
+    git checkout tags/${PL_VER} -b ${PL_VER} && \
+    git submodule update --recursive && \
+    sed -i 's/typename shared_map_type::ref_type<>/typename shared_map_type::ref_type/g' third_party/cuCollections/include/cuco/detail/static_map/helpers.cuh && \
+    sed -i '/file(GLOB_RECURSE ALL_SOURCES \${ALL_SOURCES} \${CSRC}\/\*\.cu)/a \  list(REMOVE_ITEM ALL_SOURCES "\${CMAKE_CURRENT_SOURCE_DIR}/pyg_lib/csrc/classes/cuda/hash_map.cu")' CMakeLists.txt && \
+    python3 -m pip install -e . --no-build-isolation
+
+ENV PCL_VER=1.6.3
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/rusty1s/pytorch_cluster.git && \
+    cd pytorch_cluster && \
+    git checkout tags/${PCL_VER} -b ${PCL_VER} && \
+    python3 -m pip install -e . --no-build-isolation
+
+ENV PSC_VER=2.1.2
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/rusty1s/pytorch_scatter.git && \
+    cd pytorch_scatter && \
+    git checkout tags/${PSC_VER} -b ${PSC_VER} && \
+    python3 -m pip install -e . --no-build-isolation
+
+ENV PSPA_VER=0.6.18
+RUN source mochaenv/bin/activate && \
+    git clone --recursive https://github.com/rusty1s/pytorch_sparse.git && \
+    cd pytorch_sparse && \
+    git checkout tags/${PSPA_VER} -b ${PSPA_VER} && \
+    python3 -m pip install -e . --no-build-isolation
+
+ENV PSPL_VER=1.2.2
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/rusty1s/pytorch_spline_conv.git && \
+    cd pytorch_spline_conv && \
+    git checkout tags/${PSPL_VER} -b ${PSPL_VER} && \
+    python3 -m pip install -e . --no-build-isolation
+
+ENV PG_VER=2.7.0
+RUN source mochaenv/bin/activate && \
+    git clone https://github.com/pyg-team/pytorch_geometric.git && \
+    cd pytorch_geometric && \
+    git checkout tags/${PG_VER} -b ${PG_VER} && \
+    python3 -m pip install -e .
+
+# add files. .bash_aliases gets sourced from the su command in entrypoint.sh
+ADD --chown=dockeruser:dockeruser ./scripts ./scripts
+COPY --chown=dockeruser:dockeruser ./scripts/bash_aliases ${DOCKERUSERHOME}/.bash_aliases
+COPY --chown=dockeruser:dockeruser ./scripts/run_all_tests.sh ${DOCKERUSERHOME}/
+
+# go in as root and change user in entrypoint.sh
+USER root
+# set entrypoint
+ENTRYPOINT ["./scripts/entrypoint.sh"]

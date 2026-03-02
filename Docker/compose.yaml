@@ -1,0 +1,11 @@
+services:
+  mocha:
+    build: .
+    command: /bin/bash
+    image: mocha:24.04
+    ports:
+      - "6006:6006"
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./step_cpu:/home/ginasohn/step_cpu
