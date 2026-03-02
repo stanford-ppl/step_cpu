@@ -1,3 +1,5 @@
+
+# Vectorization
 Can I see the generated c++ code for Gelu? Also, is it using vectorized instructions for high performance?
 
 ● Read 1 file (ctrl+o to expand)
