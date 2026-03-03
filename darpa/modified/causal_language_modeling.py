@@ -346,6 +346,7 @@ class GPT2MLPStepWrapper(torch.nn.Module):
         shape = hidden_states.shape  # [batch, seq, 768]
         x2d = hidden_states.reshape(shape[0] * shape[1], shape[2]).contiguous()
 
+        # print(f"GPT2MLPStepWrapper forward called")
         out = self._compiled_kernel(
             x2d,
             self.c_fc.weight,
