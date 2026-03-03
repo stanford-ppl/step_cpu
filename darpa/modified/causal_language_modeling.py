@@ -10,13 +10,18 @@
 import argparse
 import os
 import math
+import sys
 import time
 import warnings
 import threading
 from collections import namedtuple
 from typing import List, Dict
 
+import pathlib as _pathlib
 import torch
+
+_PROJECT_ROOT = str(_pathlib.Path(__file__).resolve().parents[2])  # mocha/
+
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
@@ -308,6 +313,209 @@ class NoOpTimer:
 BenchmarkResult = namedtuple("BenchmarkResult", ["perplexity", "elapsed_time"])
 
 
+# --------------------------------------------------------------
+#  STeP module replacement infrastructure
+# --------------------------------------------------------------
+
+
+class GPT2MLPStepWrapper(torch.nn.Module):
+    """Drop-in replacement for GPT2MLP using a STeP-compiled C++ kernel.
+
+    In eval mode, uses the compiled kernel for inference.
+    In training mode, falls through to the original HuggingFace forward
+    (STeP has no autograd support).
+    """
+
+    def __init__(self, mlp_module, compiled_kernel):
+        super().__init__()
+        self.c_fc = mlp_module.c_fc
+        self.c_proj = mlp_module.c_proj
+        self.act = mlp_module.act
+        self.dropout = mlp_module.dropout
+        self._compiled_kernel = compiled_kernel
+
+    def _original_forward(self, hidden_states):
+        hidden_states = self.c_fc(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.c_proj(hidden_states)
+        return self.dropout(hidden_states)
+
+    def forward(self, hidden_states):
+        if self.training:
+            return self._original_forward(hidden_states)
+        shape = hidden_states.shape  # [batch, seq, 768]
+        x2d = hidden_states.reshape(shape[0] * shape[1], shape[2]).contiguous()
+
+        out = self._compiled_kernel(
+            x2d,
+            self.c_fc.weight,
+            self.c_fc.bias,
+            self.c_proj.weight,
+            self.c_proj.bias,
+        )
+        return out.reshape(shape)
+
+
+def _build_gpt2mlp_replacement():
+    """Lazily compile the GPT2MLP STeP kernel and return the compiled callable."""
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+
+    import math as _math
+    import step
+
+    def gpt2_mlp_step(hidden_states, W_fc, b_fc, W_proj, b_proj):
+        M = hidden_states.shape[0]
+        K_tile = 256
+        N_tile = 256
+
+        # c_fc matmul: hidden_states @ W_fc + b_fc
+        act_fc = step.tensor_to_stream(hidden_states, vec=[M, K_tile])
+        act_fc = step.Flatten(act_fc, min_rank=0, max_rank=1)
+        act_fc_buf = step.Bufferize(act_fc, rank=1)
+        act_fc_rep = step.Streamify(act_fc_buf, repeat_factor=[12], rank=1)
+
+        W_fc_T = W_fc.T.contiguous()
+        wfc_stream = step.tensor_to_stream(W_fc_T, vec=[N_tile, K_tile])
+
+        fc_partial = step.BinaryMap(
+            act_fc_rep, wfc_stream, lambda a, w: torch.mm(a, w.T)
+        )
+        fc_accum = step.Accum(fc_partial, rank=1)
+
+        bfc_stream = step.tensor_to_stream(b_fc.unsqueeze(0), vec=[1, N_tile])
+        bfc_stream = step.Flatten(bfc_stream, min_rank=0, max_rank=1)
+
+        fc_biased = step.BinaryMap(fc_accum, bfc_stream, lambda a, b: a + b)
+
+        # GELU
+        c_sqrt = _math.sqrt(2.0 / _math.pi)
+        c_pow = 0.044715
+
+        x3 = step.UnaryMap(fc_biased, lambda a: torch.pow(a, 3.0))
+        x_in = step.BinaryMap(fc_biased, x3, lambda a, b: a + c_pow * b)
+        t_in = step.UnaryMap(x_in, lambda a: c_sqrt * a)
+        t = step.UnaryMap(t_in, lambda a: torch.tanh(a))
+        onep = step.UnaryMap(t, lambda a: 1.0 + a)
+        gelu_out = step.BinaryMap(fc_biased, onep, lambda a, b: 0.5 * a * b)
+
+        # c_proj matmul: gelu_out @ W_proj + b_proj
+        proj_buf = step.Bufferize(gelu_out, rank=1)
+        proj_act_rep = step.Streamify(proj_buf, repeat_factor=[3], rank=1)
+
+        W_proj_T = W_proj.T.contiguous()
+        wproj_stream = step.tensor_to_stream(W_proj_T, vec=[N_tile, K_tile])
+
+        proj_partial = step.BinaryMap(
+            proj_act_rep, wproj_stream, lambda a, w: torch.mm(a, w.T)
+        )
+        proj_accum = step.Accum(proj_partial, rank=1)
+
+        bproj_stream = step.tensor_to_stream(b_proj.unsqueeze(0), vec=[1, N_tile])
+        bproj_stream = step.Flatten(bproj_stream, min_rank=0, max_rank=1)
+
+        proj_biased = step.BinaryMap(proj_accum, bproj_stream, lambda a, b: a + b)
+
+        output = step.stream_to_tensor(proj_biased, like_tensor=hidden_states)
+        return output
+
+    gpt2_mlp_step._param_ndims = [2, 2, 1, 2, 1]
+    return step.cpu_compile(gpt2_mlp_step)
+
+
+def _apply_gpt2mlp(model):
+    """Replace all transformer block MLPs with GPT2MLPStepWrapper."""
+    compiled_kernel = _build_gpt2mlp_replacement()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.mlp = GPT2MLPStepWrapper(block.mlp, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2MLP blocks with STeP-compiled kernel.")
+
+
+def _build_gpt2mlp_fused():
+    """Compile the hand-written fused GPT2MLP C++ kernel and return the callable."""
+    import pathlib as _pl
+    import torch.utils.cpp_extension
+
+    print("Building hand-written fused GPT2MLP C++ kernel...")
+
+    _FUSED_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <torch/library.h>
+
+torch::Tensor gpt2_mlp_fused_step(
+    torch::Tensor hidden_states, torch::Tensor W_fc,
+    torch::Tensor b_fc, torch::Tensor W_proj, torch::Tensor b_proj) {
+
+    // c_fc: hidden_states @ W_fc + b_fc  (Conv1D layout: W is [in, out])
+    auto h = torch::mm(hidden_states, W_fc);
+    h.add_(b_fc);
+
+    // GELU (tanh approximation) — single fused call
+    h = at::gelu(h, "tanh");
+
+    // c_proj: h @ W_proj + b_proj
+    auto output = torch::mm(h, W_proj);
+    output.add_(b_proj);
+
+    return output;
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_mlp_fused_step", gpt2_mlp_fused_step);
+}
+"""
+    cache_dir = _pl.Path.home() / ".cache" / "mocha" / "gpt2_mlp_fused"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cpp_path = cache_dir / "gpt2_mlp_fused_step.cpp"
+    cpp_path.write_text(_FUSED_CPP_SOURCE)
+
+    torch.utils.cpp_extension.load(
+        name="step_gpt2_mlp_fused",
+        sources=[str(cpp_path)],
+        extra_cflags=["-O3", "-std=c++17"],
+        build_directory=str(cache_dir),
+        verbose=False,
+        is_python_module=False,
+    )
+
+    op_fn = torch.ops.step_ops.gpt2_mlp_fused_step
+
+    def wrapper(*args):
+        return op_fn(*args)
+
+    return wrapper
+
+
+def _apply_gpt2mlp_fused(model):
+    """Replace all transformer block MLPs with GPT2MLPStepWrapper using the fused kernel."""
+    compiled_kernel = _build_gpt2mlp_fused()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.mlp = GPT2MLPStepWrapper(block.mlp, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2MLP blocks with hand-written fused kernel.")
+
+
+_REPLACEMENT_REGISTRY = {
+    "gpt2mlp": _apply_gpt2mlp,
+    "gpt2mlp_fused": _apply_gpt2mlp_fused,
+}
+
+
+def apply_replacements(model, replace_names):
+    """Apply named submodule replacements. Call after model.eval(), before inference."""
+    if not replace_names:
+        return
+    for name in replace_names:
+        fn = _REPLACEMENT_REGISTRY.get(name)
+        if fn is None:
+            raise ValueError(
+                f"Unknown replacement: {name!r}. Known: {list(_REPLACEMENT_REGISTRY)}"
+            )
+        fn(model)
+
+
 def parse_clm(args):
     parser = argparse.ArgumentParser(
         description=(
@@ -354,6 +562,16 @@ def parse_clm(args):
             "will try this path first and fall back to the base distilgpt2. "
             "In training mode the model is saved here after training. "
             "(default: clm-example-model)"
+        ),
+    )
+    parser.add_argument(
+        "--replace",
+        nargs="*",
+        default=[],
+        metavar="MODULE",
+        help=(
+            "Replace named model submodules with STeP-compiled kernels. "
+            "Supported: gpt2mlp. Example: --replace gpt2mlp"
         ),
     )
     return parser.parse_args(args)
@@ -425,13 +643,19 @@ def main(args=None):
                 device = torch.device("cuda")
             model.to(device)
 
+        if args.replace:
+            print(f"\nApplying module replacements: {args.replace}")
+            with TimerClass("apply_replacements", records):
+                apply_replacements(model, args.replace)
+        model.eval()
+
         with TimerClass("tokenize_prompt", records):
             inputs = tokenizer(args.prompt, return_tensors="pt")
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
         with TimerClass("generate", records):
-            model.eval()
             with torch.no_grad():
+                print("generate started")
                 output_ids = model.generate(
                     inputs["input_ids"],
                     max_new_tokens=20,

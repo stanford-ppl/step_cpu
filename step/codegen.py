@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 from .ir import (
     AccumOp,
     BinaryMapOp,
@@ -15,6 +17,44 @@ from .ir import (
     UnaryMapOp,
 )
 from .lambda_parser import LambdaTranslator
+
+
+# ---------------------------------------------------------------------------
+# AST helper functions for pattern detection
+# ---------------------------------------------------------------------------
+
+def _ast_has_transpose(node: ast.expr, param_name: str) -> bool:
+    """Check if an AST expression contains `<param_name>.T`."""
+    if isinstance(node, ast.Attribute) and node.attr == "T":
+        if isinstance(node.value, ast.Name) and node.value.id == param_name:
+            return True
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.expr) and _ast_has_transpose(child, param_name):
+            return True
+    return False
+
+
+def _ast_calls_func(node: ast.expr, func_name: str) -> bool:
+    """Check if an AST expression calls a function named func_name (e.g. 'pow', 'tanh')."""
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == func_name:
+            return True
+        if isinstance(node.func, ast.Name) and node.func.id == func_name:
+            return True
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.expr) and _ast_calls_func(child, func_name):
+            return True
+    return False
+
+
+def _has_closure_near(node, target: float, rtol: float = 0.01) -> bool:
+    """Check if an IR node (UnaryMapOp or BinaryMapOp) has a closure value near target."""
+    closures = getattr(node, 'closures', {})
+    for val in closures.values():
+        if isinstance(val, (int, float)):
+            if abs(val - target) <= rtol * abs(target):
+                return True
+    return False
 
 
 class CppCodegen:
@@ -155,9 +195,157 @@ class CppCodegen:
 
     def _generate_multistage(self) -> str:
         self._emit_preamble()
+        sorted_nodes = self.graph.topo_sort()
+        stages = self._analyze_stages(sorted_nodes)
+        if self._try_emit_fused(stages, sorted_nodes):
+            self._emit_registration()
+            return "\n".join(self.lines) + "\n"
+        # Fallback: reset and use existing tiled codegen
+        self.lines = []
+        self._indent = 0
+        self._emit_preamble()
         self._emit_multistage_function()
         self._emit_registration()
         return "\n".join(self.lines) + "\n"
+
+    # ------------------------------------------------------------------
+    # Fused codegen: transpose cancellation + GELU fusion
+    # ------------------------------------------------------------------
+
+    def _detect_transpose_cancellation(self, stage: dict) -> bool:
+        """Check if a stage's weight undergoes .T.contiguous() AND the matmul
+        lambda does torch.mm(a, w.T).  When both hold, the two transposes
+        cancel and we can use the original weight parameter directly."""
+        weight_src = stage.get('weight_source')
+        matmul = stage.get('matmul')
+        if weight_src is None or matmul is None:
+            return False
+
+        # 1. Check transforms: must start with [('T',), ('contiguous',)]
+        transforms = getattr(weight_src, 'transforms', [])
+        if len(transforms) < 2:
+            return False
+        if transforms[0][0] != 'T' or transforms[1][0] != 'contiguous':
+            return False
+
+        # 2. Check the matmul lambda AST for w.T
+        weight_param = matmul.func_params[1]
+        return _ast_has_transpose(matmul.func_ast, weight_param)
+
+    def _detect_gelu_pattern(self, post_accum: list) -> bool:
+        """Detect the NewGELU pattern in the post-accum node chain.
+
+        The pattern consists of:
+        - torch.pow call (UnaryMapOp)
+        - torch.tanh call (UnaryMapOp)
+        - closure value near 0.044715 (the GELU constant)
+        """
+        has_pow = False
+        has_tanh = False
+        has_gelu_constant = False
+
+        for node in post_accum:
+            if isinstance(node, UnaryMapOp):
+                if _ast_calls_func(node.func_ast, 'pow'):
+                    has_pow = True
+                if _ast_calls_func(node.func_ast, 'tanh'):
+                    has_tanh = True
+            if isinstance(node, (UnaryMapOp, BinaryMapOp)):
+                if _has_closure_near(node, 0.044715):
+                    has_gelu_constant = True
+
+        return has_pow and has_tanh and has_gelu_constant
+
+    def _try_emit_fused(self, stages: list[dict], sorted_nodes: list) -> bool:
+        """Try to emit a fused C++ function for all stages.
+
+        For each stage, checks transpose cancellation and collects fusion info.
+        If all stages are fusible, calls _emit_fused_function().
+        Returns True on success, False to trigger tiled fallback.
+        """
+        fused_stages = []
+        for stage in stages:
+            cancel = self._detect_transpose_cancellation(stage)
+            if not cancel:
+                return False
+            gelu = self._detect_gelu_pattern(stage['post_accum'])
+            fused_stages.append({
+                'stage': stage,
+                'has_gelu': gelu,
+            })
+
+        # Save current state for safe fallback
+        saved_lines = list(self.lines)
+        saved_indent = self._indent
+
+        try:
+            self._emit_fused_function(fused_stages)
+            return True
+        except Exception:
+            # Restore state on failure
+            self.lines = saved_lines
+            self._indent = saved_indent
+            return False
+
+    def _emit_fused_function(self, fused_stages: list[dict]) -> None:
+        """Emit the optimized fused C++ function.
+
+        - No weight transforms (transpose cancelled)
+        - No buffer allocations
+        - No tiled loops
+        - Single torch::mm(act, weight) per stage
+        - In-place h.add_(bias) using original param name
+        - at::gelu(h, "tanh") when GELU detected
+        """
+        func_name = self.graph.func_name + "_step"
+        params = ", ".join(f"torch::Tensor {p}" for p in self.graph.tensor_params)
+        self._emit(f"torch::Tensor {func_name}({params}) {{")
+        self._indent_inc()
+
+        num_stages = len(fused_stages)
+        for i, fused in enumerate(fused_stages):
+            stage = fused['stage']
+            has_gelu = fused['has_gelu']
+            is_last = (i == num_stages - 1)
+
+            # Get original weight param name (before transforms)
+            weight_src = stage['weight_source']
+            weight_param = weight_src.tensor_param
+
+            # Get bias param name
+            bias_src = stage.get('bias_source')
+            bias_param = bias_src.tensor_param if bias_src else None
+
+            # Get activation source
+            if i == 0:
+                # First stage: activation comes from the primary input tensor
+                act_name = self.graph.tensor_params[0]
+            else:
+                act_name = "h"
+
+            # Determine output variable name
+            if is_last:
+                out_var = "output"
+            else:
+                out_var = "h"
+
+            # Emit matmul: single GEMM, no transpose
+            self._emit(f"auto {out_var} = torch::mm({act_name}, {weight_param});")
+
+            # Emit bias add
+            if bias_param:
+                self._emit(f"{out_var}.add_({bias_param});")
+
+            # Emit fused GELU if detected
+            if has_gelu:
+                self._emit(f'{out_var} = at::gelu({out_var}, "tanh");')
+
+            self._emit()
+
+        self._emit("return output;")
+        self._indent_dec()
+        self._emit("}")
+        self._emit()
 
     def _emit_multistage_function(self) -> None:
         func_name = self.graph.func_name + "_step"
