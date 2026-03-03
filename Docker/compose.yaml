@@ -8,4 +8,4 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - ./step_cpu:/home/ginasohn/step_cpu
+      - ../step_cpu:/home/dockeruser/step_cpu

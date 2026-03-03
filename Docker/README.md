@@ -19,12 +19,19 @@ cp /path/to/step_cpu/Docker/compose.yaml /path/to/darpa-mocha
 
 # This will save the build log to compose-build.log in detail.
 docker compose build --progress=plain --no-cache 2>&1 | tee compose-build.log
+```
+
+## How to run
+### Foreground
+```
 # runs it in foreground and deletes the container once exited.
 docker compose run --rm -e UID=$(id -u) -e GID=$(id -g) mocha
 ```
 
+### Background
 ```bash
-# To run it in background and keep it running, use:
+# To run it in background and keep it running:
+cd /path/to/darpa-mocha/
 docker compose run -d \
   --name mocha-bg \
   -e UID=$(id -u) -e GID=$(id -g) \

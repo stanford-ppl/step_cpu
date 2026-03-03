@@ -63,6 +63,9 @@ env/
 .claude/
 *.nfs*
 
+# weights
+clm-example-model/
+
 # OS
 .DS_Store
 Thumbs.db
