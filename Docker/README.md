@@ -43,3 +43,19 @@ docker stop mocha-bg
 # Remove it
 docker rm mocha-bg
 ```
+
+## Once in the container
+```
+source mochaenv/bin/activate
+```
+
+## Content mirrored
+As we used `--it` and the `compose.yaml`,
+```
+volumes:
+  - ./step_cpu:/home/ginasohn/step_cpu
+```
+the contents in these locations are mirrored.
+
+Edits on the host in ./step_cpu show up immediately in the container.
+Edits in the container under /home/ginasohn/step_cpu write back to the host
