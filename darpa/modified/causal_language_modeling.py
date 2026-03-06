@@ -1340,6 +1340,349 @@ def _apply_gpt2mlp_fused5(model):
         block.mlp = GPT2MLPStepWrapper(block.mlp, compiled_kernel)
     print(f"Replaced {len(blocks)} GPT2MLP blocks with tiled GEMV + exp-GELU kernel.")
 
+def _build_gpt2mlp_fused6():
+    """Compile the AVX512+OpenMP tiled GEMV + Pade-tanh GELU fused GPT2MLP C++ kernel."""
+    import pathlib as _pl
+    import torch.utils.cpp_extension
+
+    print("Building AVX512+OpenMP tiled GEMV + Pade-tanh GELU fused GPT2MLP C++ kernel...")
+
+    _FUSED6_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <immintrin.h>
+#include <cmath>
+#include <omp.h>
+
+// Fast tanh approximation for AVX-512: [7,6] Pade rational form
+static inline __m512 fast_tanh_avx512(__m512 x) {
+    __m512 lim = _mm512_set1_ps(4.97f);
+    __m512 x_clamped = _mm512_min_ps(_mm512_max_ps(x, _mm512_sub_ps(_mm512_setzero_ps(), lim)), lim);
+    __m512 x2 = _mm512_mul_ps(x_clamped, x_clamped);
+    __m512 x4 = _mm512_mul_ps(x2, x2);
+    __m512 x6 = _mm512_mul_ps(x4, x2);
+
+    __m512 c135135 = _mm512_set1_ps(135135.0f);
+    __m512 c17325  = _mm512_set1_ps(17325.0f);
+    __m512 c378    = _mm512_set1_ps(378.0f);
+    __m512 c62370  = _mm512_set1_ps(62370.0f);
+    __m512 c3150   = _mm512_set1_ps(3150.0f);
+    __m512 c28     = _mm512_set1_ps(28.0f);
+
+    __m512 num = _mm512_fmadd_ps(c17325, x2, c135135);
+    num = _mm512_fmadd_ps(c378, x4, num);
+    num = _mm512_add_ps(num, x6);
+
+    __m512 den = _mm512_fmadd_ps(c62370, x2, c135135);
+    den = _mm512_fmadd_ps(c3150, x4, den);
+    den = _mm512_fmadd_ps(c28, x6, den);
+
+    return _mm512_mul_ps(x_clamped, _mm512_div_ps(num, den));
+}
+
+// ============================================================
+// Tiled GEMV micro-kernel: RN=4 AVX512 vectors (64 floats) per tile
+// with software prefetch 2 K-iterations ahead
+// ============================================================
+static void gemv_tiled_chunk(const float* __restrict__ x,
+                             const float* __restrict__ W,
+                             const float* __restrict__ bias,
+                             float* __restrict__ y,
+                             int64_t K, int64_t N,
+                             int64_t n_start, int64_t n_end) {
+    constexpr int RN = 4;  // 4 AVX512 registers = 64 floats per tile
+
+    // Process in 64-float tiles
+    int64_t n = n_start;
+    for (; n + RN * 16 <= n_end; n += RN * 16) {
+        __m512 acc0 = _mm512_loadu_ps(bias + n);
+        __m512 acc1 = _mm512_loadu_ps(bias + n + 16);
+        __m512 acc2 = _mm512_loadu_ps(bias + n + 32);
+        __m512 acc3 = _mm512_loadu_ps(bias + n + 48);
+
+        for (int64_t k = 0; k < K; k++) {
+            __m512 xk = _mm512_set1_ps(x[k]);
+            const float* w_row = W + k * N + n;
+
+            // Prefetch weight row 2 iterations ahead
+            if (k + 2 < K) {
+                _mm_prefetch((const char*)(W + (k + 2) * N + n), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k + 2) * N + n + 16), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k + 2) * N + n + 32), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k + 2) * N + n + 48), _MM_HINT_T0);
+            }
+
+            acc0 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row), acc0);
+            acc1 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 16), acc1);
+            acc2 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 32), acc2);
+            acc3 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 48), acc3);
+        }
+
+        _mm512_storeu_ps(y + n, acc0);
+        _mm512_storeu_ps(y + n + 16, acc1);
+        _mm512_storeu_ps(y + n + 32, acc2);
+        _mm512_storeu_ps(y + n + 48, acc3);
+    }
+
+    // Handle remaining 16-float chunks (if chunk not multiple of 64)
+    for (; n + 16 <= n_end; n += 16) {
+        __m512 acc = _mm512_loadu_ps(bias + n);
+        for (int64_t k = 0; k < K; k++) {
+            __m512 xk = _mm512_set1_ps(x[k]);
+            acc = _mm512_fmadd_ps(xk, _mm512_loadu_ps(W + k * N + n), acc);
+        }
+        _mm512_storeu_ps(y + n, acc);
+    }
+
+    // Scalar tail
+    for (; n < n_end; n++) {
+        float sum = bias[n];
+        for (int64_t k = 0; k < K; k++) {
+            sum += x[k] * W[k * N + n];
+        }
+        y[n] = sum;
+    }
+}
+
+// OpenMP parallel GEMV: y[0..N) = x[0..K) * W[K,N] + bias[0..N)
+static void avx512_omp_gemv(const float* x, const float* W, const float* bias,
+                            float* y, int64_t K, int64_t N) {
+    #pragma omp parallel
+    {
+        int nthreads = omp_get_num_threads();
+        int tid = omp_get_thread_num();
+        // Partition N into 16-aligned chunks
+        int64_t base_chunk = (N / nthreads) & ~15LL;
+        int64_t remainder = N - base_chunk * nthreads;
+        int64_t n_start, n_end;
+        if (tid < remainder / 16) {
+            int64_t my_chunk = base_chunk + 16;
+            n_start = tid * my_chunk;
+            n_end = n_start + my_chunk;
+        } else {
+            n_start = (remainder / 16) * (base_chunk + 16) + (tid - remainder / 16) * base_chunk;
+            n_end = n_start + base_chunk;
+        }
+        if (n_end > N) n_end = N;
+        if (n_start < n_end) {
+            gemv_tiled_chunk(x, W, bias, y, K, N, n_start, n_end);
+        }
+    }
+}
+
+// ============================================================
+// Register-blocked GEMM micro-kernel: RM rows x RN vectors
+// with bias fusion and software prefetch
+// ============================================================
+template <int RM, int RN>
+static inline void gemm_ukernel(
+    float* __restrict__ C, const float* __restrict__ A,
+    const float* __restrict__ B, const float* __restrict__ bias,
+    int64_t K, int64_t N, int64_t n_offset) {
+    constexpr int VL = 16;
+    __m512 acc[RM][RN];
+    for (int i = 0; i < RM; i++)
+        for (int r = 0; r < RN; r++)
+            acc[i][r] = bias ? _mm512_loadu_ps(bias + n_offset + r * VL)
+                             : _mm512_setzero_ps();
+    for (int64_t kk = 0; kk < K; kk++) {
+        __m512 Bv[RN];
+        for (int r = 0; r < RN; r++)
+            Bv[r] = _mm512_loadu_ps(B + kk * N + n_offset + r * VL);
+        if (kk + 2 < K)
+            for (int r = 0; r < RN; r++)
+                _mm_prefetch((const char*)(B + (kk+2)*N + n_offset + r*VL), _MM_HINT_T0);
+        for (int i = 0; i < RM; i++) {
+            __m512 a = _mm512_set1_ps(A[i * K + kk]);
+            for (int r = 0; r < RN; r++)
+                acc[i][r] = _mm512_fmadd_ps(a, Bv[r], acc[i][r]);
+        }
+    }
+    for (int i = 0; i < RM; i++)
+        for (int r = 0; r < RN; r++)
+            _mm512_storeu_ps(C + i * N + n_offset + r * VL, acc[i][r]);
+}
+
+// OpenMP parallel GEMM: C[M,N] = A[M,K] * B[K,N] + bias[N]
+static void avx512_omp_gemm(
+    const float* A, const float* B, const float* bias,
+    float* C, int64_t M, int64_t K, int64_t N) {
+    constexpr int RM = 4, RN = 4, VL = 16;
+    #pragma omp parallel
+    {
+        int nthreads = omp_get_num_threads();
+        int tid = omp_get_thread_num();
+        int64_t base = (M / nthreads / RM) * RM;
+        int64_t extra = M - base * nthreads;
+        int64_t extra_threads = extra / RM;
+        int64_t m_start, m_end;
+        if (tid < extra_threads) {
+            int64_t chunk = base + RM;
+            m_start = tid * chunk;
+            m_end = m_start + chunk;
+        } else {
+            m_start = extra_threads * (base + RM) + (tid - extra_threads) * base;
+            m_end = m_start + base;
+        }
+        if (tid == nthreads - 1) m_end = M;
+        int64_t ii = m_start;
+        for (; ii + RM <= m_end; ii += RM) {
+            for (int64_t jj = 0; jj + RN*VL <= N; jj += RN*VL)
+                gemm_ukernel<RM, RN>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+            for (int64_t jj = (N/(RN*VL))*(RN*VL); jj + VL <= N; jj += VL)
+                gemm_ukernel<RM, 1>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+        }
+        for (; ii < m_end; ii++) {
+            for (int64_t jj = 0; jj + RN*VL <= N; jj += RN*VL)
+                gemm_ukernel<1, RN>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+            for (int64_t jj = (N/(RN*VL))*(RN*VL); jj + VL <= N; jj += VL)
+                gemm_ukernel<1, 1>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+        }
+    }
+}
+
+torch::Tensor gpt2_mlp_fused6_step(
+    torch::Tensor hidden_states, torch::Tensor W_fc,
+    torch::Tensor b_fc, torch::Tensor W_proj, torch::Tensor b_proj) {
+
+    TORCH_CHECK(hidden_states.is_contiguous(), "hidden_states must be contiguous");
+    TORCH_CHECK(W_fc.is_contiguous(), "W_fc must be contiguous");
+    TORCH_CHECK(W_proj.is_contiguous(), "W_proj must be contiguous");
+
+    const int64_t M = hidden_states.size(0);
+
+    if (M == 1) {
+        const int64_t D = hidden_states.size(1);  // 768
+        const int64_t K = W_fc.size(1);            // 3072
+
+        const float* x_ptr = hidden_states.data_ptr<float>();
+        const float* wfc_ptr = W_fc.data_ptr<float>();
+        const float* bfc_ptr = b_fc.data_ptr<float>();
+        const float* wproj_ptr = W_proj.data_ptr<float>();
+        const float* bproj_ptr = b_proj.data_ptr<float>();
+
+        // GEMV1: h = x * W_fc + b_fc  [1x768] x [768x3072] -> [1x3072]
+        auto h = torch::empty({1, K}, hidden_states.options());
+        float* h_ptr = h.data_ptr<float>();
+        avx512_omp_gemv(x_ptr, wfc_ptr, bfc_ptr, h_ptr, D, K);
+
+        // Fused Pade-tanh GELU on h (3072 floats, fits in L1)
+        const __m512 sqrt2overpi = _mm512_set1_ps(0.7978845608028654f);
+        const __m512 gelu_coeff  = _mm512_set1_ps(0.044715f);
+        const __m512 half_v      = _mm512_set1_ps(0.5f);
+        const __m512 one_v       = _mm512_set1_ps(1.0f);
+
+        int64_t k = 0;
+        for (; k + 15 < K; k += 16) {
+            __m512 v    = _mm512_loadu_ps(h_ptr + k);
+            __m512 v2   = _mm512_mul_ps(v, v);
+            __m512 v3   = _mm512_mul_ps(v2, v);
+            __m512 inner = _mm512_fmadd_ps(gelu_coeff, v3, v);
+            __m512 targ = _mm512_mul_ps(sqrt2overpi, inner);
+            __m512 tval = fast_tanh_avx512(targ);
+            __m512 res  = _mm512_mul_ps(half_v, _mm512_mul_ps(v, _mm512_add_ps(one_v, tval)));
+            _mm512_storeu_ps(h_ptr + k, res);
+        }
+        for (; k < K; k++) {
+            float xv = h_ptr[k];
+            float x3 = xv * xv * xv;
+            float ta = 0.7978845608028654f * (xv + 0.044715f * x3);
+            h_ptr[k] = 0.5f * xv * (1.0f + std::tanh(ta));
+        }
+
+        // GEMV2: out = h * W_proj + b_proj  [1x3072] x [3072x768] -> [1x768]
+        auto output = torch::empty({1, D}, hidden_states.options());
+        float* out_ptr = output.data_ptr<float>();
+        avx512_omp_gemv(h_ptr, wproj_ptr, bproj_ptr, out_ptr, K, D);
+
+        return output;
+    }
+
+    // M > 1 (prefill) — hand-written AVX512 GEMM with fused bias
+    const int64_t D = hidden_states.size(1);  // 768
+    const int64_t K = W_fc.size(1);           // 3072
+    const float* x_ptr = hidden_states.data_ptr<float>();
+    const float* wfc_ptr = W_fc.data_ptr<float>();
+    const float* bfc_ptr = b_fc.data_ptr<float>();
+    const float* wproj_ptr = W_proj.data_ptr<float>();
+    const float* bproj_ptr = b_proj.data_ptr<float>();
+
+    // GEMM1: h = hidden_states * W_fc + b_fc  (bias fused into GEMM)
+    auto h = torch::empty({M, K}, hidden_states.options());
+    float* h_ptr = h.data_ptr<float>();
+    avx512_omp_gemm(x_ptr, wfc_ptr, bfc_ptr, h_ptr, M, D, K);
+
+    // Fused Pade-tanh GELU (in-place, bias already applied)
+    const __m512 sqrt2overpi = _mm512_set1_ps(0.7978845608028654f);
+    const __m512 gelu_coeff  = _mm512_set1_ps(0.044715f);
+    const __m512 half_v      = _mm512_set1_ps(0.5f);
+    const __m512 one_v       = _mm512_set1_ps(1.0f);
+
+    #pragma omp parallel for if(M > 1)
+    for (int64_t m = 0; m < M; m++) {
+        float* row = h_ptr + m * K;
+        int64_t k = 0;
+        for (; k + 15 < K; k += 16) {
+            __m512 v     = _mm512_loadu_ps(row + k);
+            __m512 v2    = _mm512_mul_ps(v, v);
+            __m512 v3    = _mm512_mul_ps(v2, v);
+            __m512 inner = _mm512_fmadd_ps(gelu_coeff, v3, v);
+            __m512 targ  = _mm512_mul_ps(sqrt2overpi, inner);
+            __m512 tval  = fast_tanh_avx512(targ);
+            __m512 res   = _mm512_mul_ps(half_v, _mm512_mul_ps(v, _mm512_add_ps(one_v, tval)));
+            _mm512_storeu_ps(row + k, res);
+        }
+        for (; k < K; k++) {
+            float xv = row[k];
+            float x3 = xv * xv * xv;
+            float ta = 0.7978845608028654f * (xv + 0.044715f * x3);
+            row[k] = 0.5f * xv * (1.0f + std::tanh(ta));
+        }
+    }
+
+    // GEMM2: output = h * W_proj + b_proj  (bias fused into GEMM)
+    auto output = torch::empty({M, D}, hidden_states.options());
+    float* out_ptr = output.data_ptr<float>();
+    avx512_omp_gemm(h_ptr, wproj_ptr, bproj_ptr, out_ptr, M, K, D);
+    return output;
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_mlp_fused6_step", gpt2_mlp_fused6_step);
+}
+"""
+    cache_dir = _pl.Path.home() / ".cache" / "mocha" / "gpt2_mlp_fused6"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cpp_path = cache_dir / "gpt2_mlp_fused6_step.cpp"
+    cpp_path.write_text(_FUSED6_CPP_SOURCE)
+
+    torch.utils.cpp_extension.load(
+        name="step_gpt2_mlp_fused6",
+        sources=[str(cpp_path)],
+        extra_cflags=["-O3", "-std=c++17", "-march=native", "-fopenmp", "-mavx512f", "-mfma"],
+        extra_ldflags=["-fopenmp"],
+        build_directory=str(cache_dir),
+        verbose=False,
+        is_python_module=False,
+    )
+
+    op_fn = torch.ops.step_ops.gpt2_mlp_fused6_step
+
+    def wrapper(*args):
+        return op_fn(*args)
+
+    return wrapper
+
+
+def _apply_gpt2mlp_fused6(model):
+    """Replace all transformer block MLPs with GPT2MLPStepWrapper using the tiled GEMV + Pade-tanh GELU kernel."""
+    compiled_kernel = _build_gpt2mlp_fused6()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.mlp = GPT2MLPStepWrapper(block.mlp, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2MLP blocks with tiled GEMV + Pade-tanh GELU kernel.")
+
 
 _REPLACEMENT_REGISTRY = {
     "gpt2mlp": _apply_gpt2mlp,              # hand-written scalar MLP (mm + manual loops)
@@ -1349,6 +1692,7 @@ _REPLACEMENT_REGISTRY = {
     "gpt2mlp_fused3": _apply_gpt2mlp_fused3,  # torch::mm matmuls + single-pass fused bias+GELU loop
     "gpt2mlp_fused4": _apply_gpt2mlp_fused4,  # AVX512+OpenMP hand-written GEMV for M=1 decode
     "gpt2mlp_fused5": _apply_gpt2mlp_fused5,  # tiled GEMV + Pade-tanh GELU
+    "gpt2mlp_fused6": _apply_gpt2mlp_fused6,  # tiled GEMM + Pade-tanh GELU
 }
 
 
