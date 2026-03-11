@@ -16,13 +16,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
+from transformers import DynamicCache
 
 import causal_language_modeling as clm
 from causal_language_modeling import (
     GPT2MLPStepWrapper,
+    GPT2AttentionStepWrapper,
     _REPLACEMENT_REGISTRY,
     _build_gpt2mlp_replacement,
     _build_gpt2mlp_fused,
+    _build_gpt2attn,
+    _build_gpt2attn_fused,
+    _build_gpt2attn_flash,
     apply_replacements,
 )
 
@@ -361,3 +366,151 @@ class TestFusedReplacement:
             out = fused(x, W_fc, b_fc, W_proj, b_proj)
             torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-3,
                                        msg=f"Fused mismatch at M={M}")
+
+
+# ---------------------------------------------------------------------------
+# Attention fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def attn_compiled_kernel():
+    """Compile the baseline GPT2Attention kernel once."""
+    return _build_gpt2attn()
+
+
+@pytest.fixture(scope="module")
+def fresh_distilgpt2():
+    """Load a fresh distilgpt2 for attention tests (not shared with MLP tests)."""
+    model = AutoModelForCausalLM.from_pretrained("distilbert/distilgpt2")
+    model.eval()
+    return model
+
+
+# ---------------------------------------------------------------------------
+# TestGPT2AttentionStepWrapper — unit tests
+# ---------------------------------------------------------------------------
+
+class TestGPT2AttentionStepWrapper:
+    @pytest.fixture(autouse=True)
+    def _setup(self, fresh_distilgpt2, attn_compiled_kernel):
+        self.model = fresh_distilgpt2
+        self.kernel = attn_compiled_kernel
+        self.original_attn = self.model.transformer.h[0].attn
+        self.wrapper = GPT2AttentionStepWrapper(self.original_attn, self.kernel)
+        self.wrapper.eval()
+
+    def _make_input(self, batch=1, seq=5, hidden=768):
+        torch.manual_seed(0)
+        return torch.randn(batch, seq, hidden)
+
+    def test_output_shape_preserved(self):
+        x = self._make_input()
+        cache = DynamicCache()
+        with torch.no_grad():
+            out = self.wrapper(x, past_key_values=cache)
+        attn_output = out[0]
+        assert attn_output.shape == x.shape
+
+    def test_output_numerically_close(self):
+        x = self._make_input(batch=1, seq=5)
+        cache_w = DynamicCache()
+        cache_o = DynamicCache()
+        with torch.no_grad():
+            out_wrapper = self.wrapper(x, past_key_values=cache_w)
+            out_original = self.original_attn(x, past_key_values=cache_o)
+        torch.testing.assert_close(
+            out_wrapper[0], out_original[0], atol=1e-4, rtol=1e-3
+        )
+
+    def test_kv_cache_shapes(self):
+        x = self._make_input(batch=1, seq=5)
+        cache = DynamicCache()
+        with torch.no_grad():
+            out = self.wrapper(x, past_key_values=cache)
+        # Cache is updated in-place; read from the DynamicCache object
+        assert len(cache.layers) > 0
+        present_key = cache.layers[0].keys
+        present_value = cache.layers[0].values
+        # [B, num_heads, S, head_dim] = [1, 12, 5, 64]
+        assert present_key.shape == (1, 12, 5, 64)
+        assert present_value.shape == (1, 12, 5, 64)
+
+    def test_various_sequence_lengths(self):
+        for seq_len in (1, 5, 128):
+            x = torch.randn(1, seq_len, 768)
+            cache = DynamicCache()
+            with torch.no_grad():
+                out = self.wrapper(x, past_key_values=cache)
+            assert out[0].shape == (1, seq_len, 768), \
+                f"Shape mismatch for seq_len={seq_len}"
+
+    def test_training_mode_fallback(self):
+        self.wrapper.train()
+        assert self.wrapper.training is True
+        x = self._make_input()
+        cache = DynamicCache()
+        with torch.no_grad():
+            out = self.wrapper(x, past_key_values=cache)
+        assert out[0].shape == x.shape
+        self.wrapper.eval()
+
+
+# ---------------------------------------------------------------------------
+# TestAttentionRegistry
+# ---------------------------------------------------------------------------
+
+class TestAttentionRegistry:
+    def test_registry_contains_gpt2attn(self):
+        assert "gpt2attn" in _REPLACEMENT_REGISTRY
+        assert "gpt2attn_fused" in _REPLACEMENT_REGISTRY
+        assert "gpt2attn_flash" in _REPLACEMENT_REGISTRY
+
+    def test_gpt2attn_replaces_all_blocks(self):
+        model = AutoModelForCausalLM.from_pretrained("distilbert/distilgpt2")
+        model.eval()
+        apply_replacements(model, ["gpt2attn"])
+        for i, block in enumerate(model.transformer.h):
+            assert isinstance(block.attn, GPT2AttentionStepWrapper), \
+                f"Block {i} attn was not replaced"
+
+
+# ---------------------------------------------------------------------------
+# TestAttentionInference — end-to-end
+# ---------------------------------------------------------------------------
+
+class TestAttentionInference:
+    PROMPT = "Why is the sky blue?"
+
+    def _run_infer(self, extra_args=None):
+        args = ["--mode", "infer", "--prompt", self.PROMPT, "--cpu-only", "--no-instrument"]
+        if extra_args:
+            args += extra_args
+        return clm.main(args)
+
+    def test_infer_with_gpt2attn_replace(self):
+        result = self._run_infer(["--replace", "gpt2attn"])
+        assert result is not None
+
+    def test_infer_with_gpt2attn_fused_replace(self):
+        result = self._run_infer(["--replace", "gpt2attn_fused"])
+        assert result is not None
+
+    def test_infer_with_gpt2attn_flash_replace(self):
+        result = self._run_infer(["--replace", "gpt2attn_flash"])
+        assert result is not None
+
+    def test_timing_comparison(self, capsys):
+        """Informational: compare baseline vs attention-replaced timing."""
+        import time
+
+        t0 = time.perf_counter()
+        self._run_infer()
+        baseline = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        self._run_infer(["--replace", "gpt2attn"])
+        replaced = time.perf_counter() - t0
+
+        speedup = baseline / replaced if replaced > 0 else float("inf")
+        print(f"\n[attn timing] baseline={baseline:.2f}s  replaced={replaced:.2f}s  speedup={speedup:.2f}x")
+        assert True

@@ -1684,6 +1684,992 @@ def _apply_gpt2mlp_fused6(model):
     print(f"Replaced {len(blocks)} GPT2MLP blocks with tiled GEMV + Pade-tanh GELU kernel.")
 
 
+# --------------------------------------------------------------
+#  GPT2Attention STeP replacement infrastructure
+# --------------------------------------------------------------
+
+
+class GPT2AttentionStepWrapper(torch.nn.Module):
+    """Drop-in replacement for GPT2Attention using a STeP-compiled C++ kernel.
+
+    In eval mode, uses the compiled kernel for inference.
+    In training mode, falls through to the original HuggingFace forward.
+    """
+
+    def __init__(self, attn_module, compiled_kernel):
+        super().__init__()
+        self.c_attn = attn_module.c_attn       # Conv1D(768, 2304) — QKV projection
+        self.c_proj = attn_module.c_proj        # Conv1D(768, 768) — output projection
+        self.attn_dropout = attn_module.attn_dropout
+        self.resid_dropout = attn_module.resid_dropout
+        self.num_heads = attn_module.num_heads  # 12
+        self.head_dim = attn_module.head_dim    # 64
+        self.embed_dim = attn_module.embed_dim  # 768
+        self.scale_attn_weights = attn_module.scale_attn_weights
+        self.layer_idx = attn_module.layer_idx
+        self._compiled_kernel = compiled_kernel
+        self._original_attn = attn_module       # training fallback
+
+    def forward(self, hidden_states, past_key_values=None, cache_position=None,
+                attention_mask=None, head_mask=None,
+                encoder_hidden_states=None, encoder_attention_mask=None,
+                output_attentions=False, **kwargs):
+        if self.training:
+            return self._original_attn(
+                hidden_states, past_key_values=past_key_values,
+                cache_position=cache_position,
+                attention_mask=attention_mask, head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions, **kwargs,
+            )
+
+        # Eval path: call C++ kernel
+        shape = hidden_states.shape  # [B, S, 768]
+        B = shape[0]
+        S = shape[1]
+        x2d = hidden_states.reshape(B * S, self.embed_dim).contiguous()
+
+        # Extract past key/value from Cache object (empty tensors if no cache)
+        past_key = torch.empty(0)
+        past_value = torch.empty(0)
+        if past_key_values is not None and past_key_values.get_seq_length(self.layer_idx) > 0:
+            # Cache stores [B, num_heads, seq_len, head_dim]
+            past_key = past_key_values.layers[self.layer_idx].keys
+            past_value = past_key_values.layers[self.layer_idx].values
+
+        # Prepare attention mask (empty if None)
+        if attention_mask is not None:
+            attn_mask = attention_mask.contiguous()
+        else:
+            attn_mask = torch.empty(0)
+
+        # C++ kernel returns [output, present_key, present_value]
+        result = self._compiled_kernel(
+            x2d,
+            self.c_attn.weight,
+            self.c_attn.bias,
+            self.c_proj.weight,
+            self.c_proj.bias,
+            past_key,
+            past_value,
+            attn_mask,
+            self.num_heads,
+            B,
+        )
+
+        attn_output = result[0].reshape(shape)
+        new_key = result[1]   # [B, num_heads, total_len, head_dim]
+        new_value = result[2]
+
+        # Update the Cache object with the full key/value (overwrite previous)
+        if past_key_values is not None:
+            # We need to set the cache directly since our kernel already concatenated
+            # Ensure the cache has enough layers
+            while len(past_key_values.layers) <= self.layer_idx:
+                past_key_values.layers.append(past_key_values.layer_class_to_replicate())
+            layer = past_key_values.layers[self.layer_idx]
+            if not layer.is_initialized:
+                layer.lazy_initialization(new_key)
+            layer.keys = new_key
+            layer.values = new_value
+
+        # Return format matching GPT2Attention: (attn_output, attn_weights)
+        return attn_output, None
+
+
+def _build_gpt2attn():
+    """Compile the baseline GPT2Attention C++ kernel (torch::mm + at::softmax)."""
+    import pathlib as _pl
+    import torch.utils.cpp_extension
+
+    print("Building baseline GPT2Attention C++ kernel...")
+
+    _ATTN_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <cmath>
+#include <limits>
+
+std::vector<torch::Tensor> gpt2_attn_step(
+    torch::Tensor x,          // [M, 768]  (M = B*S)
+    torch::Tensor W_attn,     // [768, 2304]
+    torch::Tensor b_attn,     // [2304]
+    torch::Tensor W_proj,     // [768, 768]
+    torch::Tensor b_proj,     // [768]
+    torch::Tensor past_key,   // [B, 12, past_len, 64] or empty
+    torch::Tensor past_value, // [B, 12, past_len, 64] or empty
+    torch::Tensor attn_mask,  // [B, 1, 1, total_len] or empty
+    int64_t num_heads,        // 12
+    int64_t batch_size        // B
+) {
+    const int64_t M = x.size(0);
+    const int64_t embed_dim = x.size(1);       // 768
+    const int64_t head_dim = embed_dim / num_heads;  // 64
+    const int64_t S = M / batch_size;
+
+    // 1. QKV projection: qkv = x @ W_attn + b_attn -> [M, 2304]
+    auto qkv = torch::mm(x, W_attn);
+    qkv.add_(b_attn);
+
+    // 2. Split Q, K, V each [M, 768], reshape to [B, 12, S, 64]
+    auto qkv_split = qkv.chunk(3, /*dim=*/1);
+    auto Q = qkv_split[0].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto K = qkv_split[1].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto V = qkv_split[2].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+
+    // 3. Concatenate past K, V along dim=2 if provided
+    bool has_past = past_key.numel() > 0;
+    if (has_past) {
+        K = torch::cat({past_key, K}, /*dim=*/2);
+        V = torch::cat({past_value, V}, /*dim=*/2);
+    }
+
+    auto present_key = K.clone();
+    auto present_value = V.clone();
+
+    const int64_t total_len = K.size(2);
+
+    // 4. scores = Q @ K^T * (1/sqrt(64)) -> [B, 12, S, total_len]
+    auto K_t = K.transpose(-2, -1).contiguous();
+    auto scores = torch::matmul(Q.contiguous(), K_t);
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    scores.mul_(scale);
+
+    // 5. Build causal mask: for new positions only
+    //    Position i in Q (query) corresponds to position (total_len - S + i) in the full sequence
+    //    It can attend to positions 0...(total_len - S + i)
+    {
+        auto causal = torch::full({S, total_len}, -1e4, scores.options());
+        for (int64_t i = 0; i < S; i++) {
+            int64_t max_pos = total_len - S + i;
+            for (int64_t j = 0; j <= max_pos && j < total_len; j++) {
+                causal[i][j] = 0.0f;
+            }
+        }
+        // Broadcast: [1, 1, S, total_len]
+        scores.add_(causal.unsqueeze(0).unsqueeze(0));
+    }
+
+    // 6. Add HuggingFace attention_mask if provided
+    if (attn_mask.numel() > 0) {
+        scores.add_(attn_mask);
+    }
+
+    // 7. Softmax
+    auto attn_weights = at::softmax(scores, /*dim=*/-1);
+
+    // 8. context = attn_weights @ V -> [B, 12, S, 64]
+    auto context = torch::matmul(attn_weights, V.contiguous());
+
+    // 9. Merge heads -> [M, 768]
+    auto merged = context.permute({0, 2, 1, 3}).contiguous().reshape({M, embed_dim});
+
+    // 10. Output projection: output = merged @ W_proj + b_proj
+    auto output = torch::mm(merged, W_proj);
+    output.add_(b_proj);
+
+    return {output, present_key, present_value};
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_attn_step", gpt2_attn_step);
+}
+"""
+    cache_dir = _pl.Path.home() / ".cache" / "mocha" / "gpt2_attn"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cpp_path = cache_dir / "gpt2_attn_step.cpp"
+    cpp_path.write_text(_ATTN_CPP_SOURCE)
+
+    torch.utils.cpp_extension.load(
+        name="step_gpt2_attn",
+        sources=[str(cpp_path)],
+        extra_cflags=["-O3", "-std=c++17"],
+        build_directory=str(cache_dir),
+        verbose=False,
+        is_python_module=False,
+    )
+
+    op_fn = torch.ops.step_ops.gpt2_attn_step
+
+    def wrapper(*args):
+        return op_fn(*args)
+
+    return wrapper
+
+
+def _apply_gpt2attn(model):
+    """Replace all transformer block attentions with GPT2AttentionStepWrapper."""
+    compiled_kernel = _build_gpt2attn()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.attn = GPT2AttentionStepWrapper(block.attn, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2Attention blocks with baseline C++ kernel.")
+
+
+def _build_gpt2attn_fused():
+    """Compile the AVX-512 projection GPT2Attention C++ kernel."""
+    import pathlib as _pl
+    import torch.utils.cpp_extension
+
+    print("Building AVX-512 projection GPT2Attention C++ kernel...")
+
+    _ATTN_FUSED_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <immintrin.h>
+#include <cmath>
+#include <omp.h>
+#include <limits>
+
+// ============================================================
+// Tiled GEMV micro-kernel (reused from fused6 MLP)
+// ============================================================
+static void gemv_tiled_chunk(const float* __restrict__ x,
+                             const float* __restrict__ W,
+                             const float* __restrict__ bias,
+                             float* __restrict__ y,
+                             int64_t K, int64_t N,
+                             int64_t n_start, int64_t n_end) {
+    constexpr int RN = 4;
+    int64_t n = n_start;
+    for (; n + RN * 16 <= n_end; n += RN * 16) {
+        __m512 acc0 = _mm512_loadu_ps(bias + n);
+        __m512 acc1 = _mm512_loadu_ps(bias + n + 16);
+        __m512 acc2 = _mm512_loadu_ps(bias + n + 32);
+        __m512 acc3 = _mm512_loadu_ps(bias + n + 48);
+        for (int64_t k = 0; k < K; k++) {
+            __m512 xk = _mm512_set1_ps(x[k]);
+            const float* w_row = W + k * N + n;
+            if (k + 2 < K) {
+                _mm_prefetch((const char*)(W + (k+2)*N + n), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k+2)*N + n + 16), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k+2)*N + n + 32), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k+2)*N + n + 48), _MM_HINT_T0);
+            }
+            acc0 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row), acc0);
+            acc1 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 16), acc1);
+            acc2 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 32), acc2);
+            acc3 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 48), acc3);
+        }
+        _mm512_storeu_ps(y + n, acc0);
+        _mm512_storeu_ps(y + n + 16, acc1);
+        _mm512_storeu_ps(y + n + 32, acc2);
+        _mm512_storeu_ps(y + n + 48, acc3);
+    }
+    for (; n + 16 <= n_end; n += 16) {
+        __m512 acc = _mm512_loadu_ps(bias + n);
+        for (int64_t k = 0; k < K; k++) {
+            __m512 xk = _mm512_set1_ps(x[k]);
+            acc = _mm512_fmadd_ps(xk, _mm512_loadu_ps(W + k * N + n), acc);
+        }
+        _mm512_storeu_ps(y + n, acc);
+    }
+    for (; n < n_end; n++) {
+        float sum = bias[n];
+        for (int64_t k = 0; k < K; k++) sum += x[k] * W[k * N + n];
+        y[n] = sum;
+    }
+}
+
+static void avx512_omp_gemv(const float* x, const float* W, const float* bias,
+                            float* y, int64_t K, int64_t N) {
+    #pragma omp parallel
+    {
+        int nthreads = omp_get_num_threads();
+        int tid = omp_get_thread_num();
+        int64_t base_chunk = (N / nthreads) & ~15LL;
+        int64_t remainder = N - base_chunk * nthreads;
+        int64_t n_start, n_end;
+        if (tid < remainder / 16) {
+            int64_t my_chunk = base_chunk + 16;
+            n_start = tid * my_chunk;
+            n_end = n_start + my_chunk;
+        } else {
+            n_start = (remainder / 16) * (base_chunk + 16) + (tid - remainder / 16) * base_chunk;
+            n_end = n_start + base_chunk;
+        }
+        if (n_end > N) n_end = N;
+        if (n_start < n_end) {
+            gemv_tiled_chunk(x, W, bias, y, K, N, n_start, n_end);
+        }
+    }
+}
+
+// Register-blocked GEMM micro-kernel
+template <int RM, int RN>
+static inline void gemm_ukernel(
+    float* __restrict__ C, const float* __restrict__ A,
+    const float* __restrict__ B, const float* __restrict__ bias,
+    int64_t K, int64_t N, int64_t n_offset) {
+    constexpr int VL = 16;
+    __m512 acc[RM][RN];
+    for (int i = 0; i < RM; i++)
+        for (int r = 0; r < RN; r++)
+            acc[i][r] = bias ? _mm512_loadu_ps(bias + n_offset + r * VL)
+                             : _mm512_setzero_ps();
+    for (int64_t kk = 0; kk < K; kk++) {
+        __m512 Bv[RN];
+        for (int r = 0; r < RN; r++)
+            Bv[r] = _mm512_loadu_ps(B + kk * N + n_offset + r * VL);
+        if (kk + 2 < K)
+            for (int r = 0; r < RN; r++)
+                _mm_prefetch((const char*)(B + (kk+2)*N + n_offset + r*VL), _MM_HINT_T0);
+        for (int i = 0; i < RM; i++) {
+            __m512 a = _mm512_set1_ps(A[i * K + kk]);
+            for (int r = 0; r < RN; r++)
+                acc[i][r] = _mm512_fmadd_ps(a, Bv[r], acc[i][r]);
+        }
+    }
+    for (int i = 0; i < RM; i++)
+        for (int r = 0; r < RN; r++)
+            _mm512_storeu_ps(C + i * N + n_offset + r * VL, acc[i][r]);
+}
+
+static void avx512_omp_gemm(
+    const float* A, const float* B, const float* bias,
+    float* C, int64_t M, int64_t K, int64_t N) {
+    constexpr int RM = 4, RN = 4, VL = 16;
+    #pragma omp parallel
+    {
+        int nthreads = omp_get_num_threads();
+        int tid = omp_get_thread_num();
+        int64_t base = (M / nthreads / RM) * RM;
+        int64_t extra = M - base * nthreads;
+        int64_t extra_threads = extra / RM;
+        int64_t m_start, m_end;
+        if (tid < extra_threads) {
+            int64_t chunk = base + RM;
+            m_start = tid * chunk;
+            m_end = m_start + chunk;
+        } else {
+            m_start = extra_threads * (base + RM) + (tid - extra_threads) * base;
+            m_end = m_start + base;
+        }
+        if (tid == nthreads - 1) m_end = M;
+        int64_t ii = m_start;
+        for (; ii + RM <= m_end; ii += RM) {
+            for (int64_t jj = 0; jj + RN*VL <= N; jj += RN*VL)
+                gemm_ukernel<RM, RN>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+            for (int64_t jj = (N/(RN*VL))*(RN*VL); jj + VL <= N; jj += VL)
+                gemm_ukernel<RM, 1>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+        }
+        for (; ii < m_end; ii++) {
+            for (int64_t jj = 0; jj + RN*VL <= N; jj += RN*VL)
+                gemm_ukernel<1, RN>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+            for (int64_t jj = (N/(RN*VL))*(RN*VL); jj + VL <= N; jj += VL)
+                gemm_ukernel<1, 1>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+        }
+    }
+}
+
+std::vector<torch::Tensor> gpt2_attn_fused_step(
+    torch::Tensor x,
+    torch::Tensor W_attn,
+    torch::Tensor b_attn,
+    torch::Tensor W_proj,
+    torch::Tensor b_proj,
+    torch::Tensor past_key,
+    torch::Tensor past_value,
+    torch::Tensor attn_mask,
+    int64_t num_heads,
+    int64_t batch_size
+) {
+    const int64_t M = x.size(0);
+    const int64_t embed_dim = x.size(1);
+    const int64_t head_dim = embed_dim / num_heads;
+    const int64_t S = M / batch_size;
+
+    // 1. QKV projection with AVX-512 GEMM/GEMV
+    auto qkv = torch::empty({M, 3 * embed_dim}, x.options());
+    if (M == 1) {
+        avx512_omp_gemv(x.data_ptr<float>(), W_attn.data_ptr<float>(),
+                        b_attn.data_ptr<float>(), qkv.data_ptr<float>(),
+                        embed_dim, 3 * embed_dim);
+    } else {
+        avx512_omp_gemm(x.data_ptr<float>(), W_attn.data_ptr<float>(),
+                        b_attn.data_ptr<float>(), qkv.data_ptr<float>(),
+                        M, embed_dim, 3 * embed_dim);
+    }
+
+    // 2. Split Q, K, V
+    auto qkv_split = qkv.chunk(3, 1);
+    auto Q = qkv_split[0].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto K = qkv_split[1].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto V = qkv_split[2].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+
+    // 3. Concatenate past KV
+    bool has_past = past_key.numel() > 0;
+    if (has_past) {
+        K = torch::cat({past_key, K}, 2);
+        V = torch::cat({past_value, V}, 2);
+    }
+
+    auto present_key = K.clone();
+    auto present_value = V.clone();
+
+    const int64_t total_len = K.size(2);
+
+    // 4. Attention scores (still using torch ops for inner attention)
+    auto K_t = K.transpose(-2, -1).contiguous();
+    auto scores = torch::matmul(Q.contiguous(), K_t);
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    scores.mul_(scale);
+
+    // 5. Causal mask
+    {
+        auto causal = torch::full({S, total_len}, -1e4, scores.options());
+        for (int64_t i = 0; i < S; i++) {
+            int64_t max_pos = total_len - S + i;
+            for (int64_t j = 0; j <= max_pos && j < total_len; j++) {
+                causal[i][j] = 0.0f;
+            }
+        }
+        scores.add_(causal.unsqueeze(0).unsqueeze(0));
+    }
+
+    // 6. Add HF mask
+    if (attn_mask.numel() > 0) scores.add_(attn_mask);
+
+    // 7. Softmax
+    auto attn_weights = at::softmax(scores, -1);
+
+    // 8. Context
+    auto context = torch::matmul(attn_weights, V.contiguous());
+    auto merged = context.permute({0, 2, 1, 3}).contiguous().reshape({M, embed_dim});
+
+    // 9. Output projection with AVX-512
+    auto output = torch::empty({M, embed_dim}, x.options());
+    if (M == 1) {
+        avx512_omp_gemv(merged.data_ptr<float>(), W_proj.data_ptr<float>(),
+                        b_proj.data_ptr<float>(), output.data_ptr<float>(),
+                        embed_dim, embed_dim);
+    } else {
+        avx512_omp_gemm(merged.data_ptr<float>(), W_proj.data_ptr<float>(),
+                        b_proj.data_ptr<float>(), output.data_ptr<float>(),
+                        M, embed_dim, embed_dim);
+    }
+
+    return {output, present_key, present_value};
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_attn_fused_step", gpt2_attn_fused_step);
+}
+"""
+    cache_dir = _pl.Path.home() / ".cache" / "mocha" / "gpt2_attn_fused"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cpp_path = cache_dir / "gpt2_attn_fused_step.cpp"
+    cpp_path.write_text(_ATTN_FUSED_CPP_SOURCE)
+
+    torch.utils.cpp_extension.load(
+        name="step_gpt2_attn_fused",
+        sources=[str(cpp_path)],
+        extra_cflags=["-O3", "-std=c++17", "-march=native", "-fopenmp", "-mavx512f", "-mfma"],
+        extra_ldflags=["-fopenmp"],
+        build_directory=str(cache_dir),
+        verbose=False,
+        is_python_module=False,
+    )
+
+    op_fn = torch.ops.step_ops.gpt2_attn_fused_step
+
+    def wrapper(*args):
+        return op_fn(*args)
+
+    return wrapper
+
+
+def _apply_gpt2attn_fused(model):
+    """Replace all transformer block attentions with AVX-512 projection kernel."""
+    compiled_kernel = _build_gpt2attn_fused()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.attn = GPT2AttentionStepWrapper(block.attn, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2Attention blocks with AVX-512 projection kernel.")
+
+
+def _build_gpt2attn_flash():
+    """Compile the full flash attention GPT2Attention C++ kernel."""
+    import pathlib as _pl
+    import torch.utils.cpp_extension
+
+    print("Building flash attention GPT2Attention C++ kernel...")
+
+    _ATTN_FLASH_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <immintrin.h>
+#include <cmath>
+#include <omp.h>
+#include <limits>
+#include <cstring>
+
+// ============================================================
+// AVX-512 fast exp (ported from llama.cpp ggml_v_expf)
+// ============================================================
+static inline __m512 fast_exp_avx512(__m512 x) {
+    const __m512 r = _mm512_set1_ps(0x1.8p23f);
+    const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+    const __m512 n = _mm512_sub_ps(z, r);
+    const __m512 b =
+        _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
+                         _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+    const __mmask16 d =
+        _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
+    const __m512 u = _mm512_mul_ps(b, b);
+    const __m512 j = _mm512_fmadd_ps(
+        _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), b,
+                                        _mm512_set1_ps(0x1.573e2ep-5f)),
+                        u,
+                        _mm512_fmadd_ps(_mm512_set1_ps(0x1.555e66p-3f), b,
+                                        _mm512_set1_ps(0x1.fffdb6p-2f))),
+        u,
+        _mm512_fmadd_ps(_mm512_set1_ps(0x1.ffffecp-1f), b, _mm512_set1_ps(1.0F)));
+    const __m512 res = _mm512_scalef_ps(j, n);
+    if (_mm512_kortestz(d, d))
+        return res;
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 alt = _mm512_mask_blend_ps(
+        _mm512_cmp_ps_mask(n, zero, _CMP_LE_OQ), _mm512_set1_ps(INFINITY), zero);
+    return _mm512_mask_blend_ps(d, res, alt);
+}
+
+// ============================================================
+// Tiled GEMV (from fused6)
+// ============================================================
+static void gemv_tiled_chunk(const float* __restrict__ x,
+                             const float* __restrict__ W,
+                             const float* __restrict__ bias,
+                             float* __restrict__ y,
+                             int64_t K, int64_t N,
+                             int64_t n_start, int64_t n_end) {
+    constexpr int RN = 4;
+    int64_t n = n_start;
+    for (; n + RN * 16 <= n_end; n += RN * 16) {
+        __m512 acc0 = _mm512_loadu_ps(bias + n);
+        __m512 acc1 = _mm512_loadu_ps(bias + n + 16);
+        __m512 acc2 = _mm512_loadu_ps(bias + n + 32);
+        __m512 acc3 = _mm512_loadu_ps(bias + n + 48);
+        for (int64_t k = 0; k < K; k++) {
+            __m512 xk = _mm512_set1_ps(x[k]);
+            const float* w_row = W + k * N + n;
+            if (k + 2 < K) {
+                _mm_prefetch((const char*)(W + (k+2)*N + n), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k+2)*N + n + 16), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k+2)*N + n + 32), _MM_HINT_T0);
+                _mm_prefetch((const char*)(W + (k+2)*N + n + 48), _MM_HINT_T0);
+            }
+            acc0 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row), acc0);
+            acc1 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 16), acc1);
+            acc2 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 32), acc2);
+            acc3 = _mm512_fmadd_ps(xk, _mm512_loadu_ps(w_row + 48), acc3);
+        }
+        _mm512_storeu_ps(y + n, acc0);
+        _mm512_storeu_ps(y + n + 16, acc1);
+        _mm512_storeu_ps(y + n + 32, acc2);
+        _mm512_storeu_ps(y + n + 48, acc3);
+    }
+    for (; n + 16 <= n_end; n += 16) {
+        __m512 acc = _mm512_loadu_ps(bias + n);
+        for (int64_t k = 0; k < K; k++) {
+            __m512 xk = _mm512_set1_ps(x[k]);
+            acc = _mm512_fmadd_ps(xk, _mm512_loadu_ps(W + k * N + n), acc);
+        }
+        _mm512_storeu_ps(y + n, acc);
+    }
+    for (; n < n_end; n++) {
+        float sum = bias[n];
+        for (int64_t k = 0; k < K; k++) sum += x[k] * W[k * N + n];
+        y[n] = sum;
+    }
+}
+
+static void avx512_omp_gemv(const float* x, const float* W, const float* bias,
+                            float* y, int64_t K, int64_t N) {
+    #pragma omp parallel
+    {
+        int nthreads = omp_get_num_threads();
+        int tid = omp_get_thread_num();
+        int64_t base_chunk = (N / nthreads) & ~15LL;
+        int64_t remainder = N - base_chunk * nthreads;
+        int64_t n_start, n_end;
+        if (tid < remainder / 16) {
+            int64_t my_chunk = base_chunk + 16;
+            n_start = tid * my_chunk;
+            n_end = n_start + my_chunk;
+        } else {
+            n_start = (remainder / 16) * (base_chunk + 16) + (tid - remainder / 16) * base_chunk;
+            n_end = n_start + base_chunk;
+        }
+        if (n_end > N) n_end = N;
+        if (n_start < n_end) {
+            gemv_tiled_chunk(x, W, bias, y, K, N, n_start, n_end);
+        }
+    }
+}
+
+// Register-blocked GEMM micro-kernel
+template <int RM, int RN>
+static inline void gemm_ukernel(
+    float* __restrict__ C, const float* __restrict__ A,
+    const float* __restrict__ B, const float* __restrict__ bias,
+    int64_t K, int64_t N, int64_t n_offset) {
+    constexpr int VL = 16;
+    __m512 acc[RM][RN];
+    for (int i = 0; i < RM; i++)
+        for (int r = 0; r < RN; r++)
+            acc[i][r] = bias ? _mm512_loadu_ps(bias + n_offset + r * VL)
+                             : _mm512_setzero_ps();
+    for (int64_t kk = 0; kk < K; kk++) {
+        __m512 Bv[RN];
+        for (int r = 0; r < RN; r++)
+            Bv[r] = _mm512_loadu_ps(B + kk * N + n_offset + r * VL);
+        if (kk + 2 < K)
+            for (int r = 0; r < RN; r++)
+                _mm_prefetch((const char*)(B + (kk+2)*N + n_offset + r*VL), _MM_HINT_T0);
+        for (int i = 0; i < RM; i++) {
+            __m512 a = _mm512_set1_ps(A[i * K + kk]);
+            for (int r = 0; r < RN; r++)
+                acc[i][r] = _mm512_fmadd_ps(a, Bv[r], acc[i][r]);
+        }
+    }
+    for (int i = 0; i < RM; i++)
+        for (int r = 0; r < RN; r++)
+            _mm512_storeu_ps(C + i * N + n_offset + r * VL, acc[i][r]);
+}
+
+static void avx512_omp_gemm(
+    const float* A, const float* B, const float* bias,
+    float* C, int64_t M, int64_t K, int64_t N) {
+    constexpr int RM = 4, RN = 4, VL = 16;
+    #pragma omp parallel
+    {
+        int nthreads = omp_get_num_threads();
+        int tid = omp_get_thread_num();
+        int64_t base = (M / nthreads / RM) * RM;
+        int64_t extra = M - base * nthreads;
+        int64_t extra_threads = extra / RM;
+        int64_t m_start, m_end;
+        if (tid < extra_threads) {
+            int64_t chunk = base + RM;
+            m_start = tid * chunk;
+            m_end = m_start + chunk;
+        } else {
+            m_start = extra_threads * (base + RM) + (tid - extra_threads) * base;
+            m_end = m_start + base;
+        }
+        if (tid == nthreads - 1) m_end = M;
+        int64_t ii = m_start;
+        for (; ii + RM <= m_end; ii += RM) {
+            for (int64_t jj = 0; jj + RN*VL <= N; jj += RN*VL)
+                gemm_ukernel<RM, RN>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+            for (int64_t jj = (N/(RN*VL))*(RN*VL); jj + VL <= N; jj += VL)
+                gemm_ukernel<RM, 1>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+        }
+        for (; ii < m_end; ii++) {
+            for (int64_t jj = 0; jj + RN*VL <= N; jj += RN*VL)
+                gemm_ukernel<1, RN>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+            for (int64_t jj = (N/(RN*VL))*(RN*VL); jj + VL <= N; jj += VL)
+                gemm_ukernel<1, 1>(C + ii*N, A + ii*K, B, bias, K, N, jj);
+        }
+    }
+}
+
+// ============================================================
+// Flash attention core: tiled online softmax per head
+// ============================================================
+static void flash_attention_head(
+    const float* Q_row,    // [S, head_dim] row-major
+    const float* K_all,    // [total_len, head_dim] row-major
+    const float* V_all,    // [total_len, head_dim] row-major
+    float* output,         // [S, head_dim]
+    const float* mask_row, // [S, total_len] causal+hf mask combined, or nullptr
+    int64_t S, int64_t total_len, int64_t head_dim, float scale
+) {
+    constexpr int KV_TILE = 64;
+
+    for (int64_t q = 0; q < S; q++) {
+        const float* q_vec = Q_row + q * head_dim;
+        float* acc = output + q * head_dim;
+
+        float M_val = -INFINITY;
+        float S_val = 0.0f;
+        std::memset(acc, 0, head_dim * sizeof(float));
+
+        for (int64_t kv0 = 0; kv0 < total_len; kv0 += KV_TILE) {
+            const int64_t kv_end = std::min(kv0 + (int64_t)KV_TILE, total_len);
+            const int64_t kv_tile_len = kv_end - kv0;
+
+            // Check if entire tile is masked
+            if (mask_row) {
+                bool all_masked = true;
+                for (int64_t t = 0; t < kv_tile_len; t++) {
+                    if (mask_row[q * total_len + kv0 + t] > -1e3f) {
+                        all_masked = false;
+                        break;
+                    }
+                }
+                if (all_masked) continue;
+            }
+
+            // Compute Q @ K^T for this tile: scores[kv_tile_len]
+            float scores[KV_TILE];
+            for (int64_t t = 0; t < kv_tile_len; t++) {
+                const float* k_vec = K_all + (kv0 + t) * head_dim;
+                float dot = 0.0f;
+
+                // AVX-512 dot product for head_dim=64 (4 vectors of 16)
+                int64_t d = 0;
+                __m512 sum_v = _mm512_setzero_ps();
+                for (; d + 15 < head_dim; d += 16) {
+                    __m512 qv = _mm512_loadu_ps(q_vec + d);
+                    __m512 kv = _mm512_loadu_ps(k_vec + d);
+                    sum_v = _mm512_fmadd_ps(qv, kv, sum_v);
+                }
+                dot = _mm512_reduce_add_ps(sum_v);
+                for (; d < head_dim; d++) {
+                    dot += q_vec[d] * k_vec[d];
+                }
+
+                scores[t] = dot * scale;
+
+                // Apply mask
+                if (mask_row) {
+                    scores[t] += mask_row[q * total_len + kv0 + t];
+                }
+            }
+
+            // Online softmax update
+            float tile_max = -INFINITY;
+            for (int64_t t = 0; t < kv_tile_len; t++) {
+                if (scores[t] > tile_max) tile_max = scores[t];
+            }
+
+            if (tile_max == -INFINITY) continue;
+
+            float M_new = std::fmax(M_val, tile_max);
+
+            // Rescale existing accumulator
+            if (M_val > -INFINITY) {
+                float rescale = std::exp(M_val - M_new);
+                S_val *= rescale;
+                // Rescale acc using AVX-512
+                __m512 rs = _mm512_set1_ps(rescale);
+                int64_t d = 0;
+                for (; d + 15 < head_dim; d += 16) {
+                    __m512 av = _mm512_loadu_ps(acc + d);
+                    _mm512_storeu_ps(acc + d, _mm512_mul_ps(av, rs));
+                }
+                for (; d < head_dim; d++) acc[d] *= rescale;
+            }
+            M_val = M_new;
+
+            // Compute exp(scores - M_new) using fast_exp_avx512
+            float exp_scores[KV_TILE];
+            {
+                int64_t t = 0;
+                for (; t + 15 < kv_tile_len; t += 16) {
+                    __m512 sv = _mm512_loadu_ps(scores + t);
+                    __m512 shifted = _mm512_sub_ps(sv, _mm512_set1_ps(M_new));
+                    __m512 ev = fast_exp_avx512(shifted);
+                    _mm512_storeu_ps(exp_scores + t, ev);
+                }
+                for (; t < kv_tile_len; t++) {
+                    exp_scores[t] = std::exp(scores[t] - M_new);
+                }
+            }
+
+            // Accumulate S
+            for (int64_t t = 0; t < kv_tile_len; t++) {
+                S_val += exp_scores[t];
+            }
+
+            // Accumulate: acc += exp_scores @ V_tile
+            for (int64_t t = 0; t < kv_tile_len; t++) {
+                if (exp_scores[t] == 0.0f) continue;
+                const float* v_vec = V_all + (kv0 + t) * head_dim;
+                __m512 ev = _mm512_set1_ps(exp_scores[t]);
+                int64_t d = 0;
+                for (; d + 15 < head_dim; d += 16) {
+                    __m512 av = _mm512_loadu_ps(acc + d);
+                    __m512 vv = _mm512_loadu_ps(v_vec + d);
+                    _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(ev, vv, av));
+                }
+                for (; d < head_dim; d++) {
+                    acc[d] += exp_scores[t] * v_vec[d];
+                }
+            }
+        }
+
+        // Normalize: acc /= S
+        if (S_val > 0.0f) {
+            float inv_s = 1.0f / S_val;
+            __m512 inv_v = _mm512_set1_ps(inv_s);
+            int64_t d = 0;
+            for (; d + 15 < head_dim; d += 16) {
+                __m512 av = _mm512_loadu_ps(acc + d);
+                _mm512_storeu_ps(acc + d, _mm512_mul_ps(av, inv_v));
+            }
+            for (; d < head_dim; d++) acc[d] *= inv_s;
+        }
+    }
+}
+
+std::vector<torch::Tensor> gpt2_attn_flash_step(
+    torch::Tensor x,
+    torch::Tensor W_attn,
+    torch::Tensor b_attn,
+    torch::Tensor W_proj,
+    torch::Tensor b_proj,
+    torch::Tensor past_key,
+    torch::Tensor past_value,
+    torch::Tensor attn_mask,
+    int64_t num_heads,
+    int64_t batch_size
+) {
+    const int64_t M = x.size(0);
+    const int64_t embed_dim = x.size(1);
+    const int64_t head_dim = embed_dim / num_heads;
+    const int64_t S = M / batch_size;
+
+    // 1. QKV projection with AVX-512 GEMM/GEMV
+    auto qkv = torch::empty({M, 3 * embed_dim}, x.options());
+    if (M == 1) {
+        avx512_omp_gemv(x.data_ptr<float>(), W_attn.data_ptr<float>(),
+                        b_attn.data_ptr<float>(), qkv.data_ptr<float>(),
+                        embed_dim, 3 * embed_dim);
+    } else {
+        avx512_omp_gemm(x.data_ptr<float>(), W_attn.data_ptr<float>(),
+                        b_attn.data_ptr<float>(), qkv.data_ptr<float>(),
+                        M, embed_dim, 3 * embed_dim);
+    }
+
+    // 2. Split Q, K, V and reshape to [B, num_heads, S, head_dim]
+    auto qkv_split = qkv.chunk(3, 1);
+    auto Q = qkv_split[0].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3}).contiguous();
+    auto K = qkv_split[1].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3}).contiguous();
+    auto V = qkv_split[2].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3}).contiguous();
+
+    // 3. Concatenate past KV
+    bool has_past = past_key.numel() > 0;
+    if (has_past) {
+        K = torch::cat({past_key, K}, 2).contiguous();
+        V = torch::cat({past_value, V}, 2).contiguous();
+    }
+
+    auto present_key = K.clone();
+    auto present_value = V.clone();
+
+    const int64_t total_len = K.size(2);
+    float scale = 1.0f / std::sqrt((float)head_dim);
+
+    // 4. Build combined causal + HF mask: [B, num_heads, S, total_len]
+    //    (we flatten to per-query-row for the flash kernel)
+    auto combined_mask = torch::full({S, total_len}, -1e4f, x.options());
+    for (int64_t i = 0; i < S; i++) {
+        int64_t max_pos = total_len - S + i;
+        for (int64_t j = 0; j <= max_pos && j < total_len; j++) {
+            combined_mask[i][j] = 0.0f;
+        }
+    }
+    float* causal_ptr = combined_mask.data_ptr<float>();
+
+    // If HF mask provided, we need per-batch masks
+    bool has_hf_mask = attn_mask.numel() > 0;
+    // For simplicity, expand HF mask per batch
+    // HF mask shape: [B, 1, 1, total_len]
+    // We'll handle it inside the parallel loop
+
+    // 5. Flash attention: parallel over B * num_heads
+    auto context = torch::empty({batch_size, num_heads, S, head_dim}, x.options());
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int64_t bh = 0; bh < batch_size * num_heads; bh++) {
+        int64_t b = bh / num_heads;
+        int64_t h = bh % num_heads;
+
+        const float* Q_ptr = Q.data_ptr<float>() + (b * num_heads + h) * S * head_dim;
+        const float* K_ptr = K.data_ptr<float>() + (b * num_heads + h) * total_len * head_dim;
+        const float* V_ptr = V.data_ptr<float>() + (b * num_heads + h) * total_len * head_dim;
+        float* out_ptr = context.data_ptr<float>() + (b * num_heads + h) * S * head_dim;
+
+        // Build per-head mask combining causal + HF
+        // Thread-local mask buffer
+        std::vector<float> mask_buf(S * total_len);
+        std::memcpy(mask_buf.data(), causal_ptr, S * total_len * sizeof(float));
+
+        if (has_hf_mask) {
+            // HF mask: [B, 1, 1, total_len] — broadcast to [S, total_len]
+            const float* hf_ptr = attn_mask.data_ptr<float>() + b * total_len;
+            for (int64_t i = 0; i < S; i++) {
+                for (int64_t j = 0; j < total_len; j++) {
+                    mask_buf[i * total_len + j] += hf_ptr[j];
+                }
+            }
+        }
+
+        flash_attention_head(Q_ptr, K_ptr, V_ptr, out_ptr, mask_buf.data(),
+                            S, total_len, head_dim, scale);
+    }
+
+    // 6. Merge heads: [B, num_heads, S, head_dim] -> [M, embed_dim]
+    auto merged = context.permute({0, 2, 1, 3}).contiguous().reshape({M, embed_dim});
+
+    // 7. Output projection with AVX-512
+    auto output = torch::empty({M, embed_dim}, x.options());
+    if (M == 1) {
+        avx512_omp_gemv(merged.data_ptr<float>(), W_proj.data_ptr<float>(),
+                        b_proj.data_ptr<float>(), output.data_ptr<float>(),
+                        embed_dim, embed_dim);
+    } else {
+        avx512_omp_gemm(merged.data_ptr<float>(), W_proj.data_ptr<float>(),
+                        b_proj.data_ptr<float>(), output.data_ptr<float>(),
+                        M, embed_dim, embed_dim);
+    }
+
+    return {output, present_key, present_value};
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_attn_flash_step", gpt2_attn_flash_step);
+}
+"""
+    cache_dir = _pl.Path.home() / ".cache" / "mocha" / "gpt2_attn_flash"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cpp_path = cache_dir / "gpt2_attn_flash_step.cpp"
+    cpp_path.write_text(_ATTN_FLASH_CPP_SOURCE)
+
+    torch.utils.cpp_extension.load(
+        name="step_gpt2_attn_flash",
+        sources=[str(cpp_path)],
+        extra_cflags=["-O3", "-std=c++17", "-march=native", "-fopenmp", "-mavx512f", "-mfma"],
+        extra_ldflags=["-fopenmp"],
+        build_directory=str(cache_dir),
+        verbose=False,
+        is_python_module=False,
+    )
+
+    op_fn = torch.ops.step_ops.gpt2_attn_flash_step
+
+    def wrapper(*args):
+        return op_fn(*args)
+
+    return wrapper
+
+
+def _apply_gpt2attn_flash(model):
+    """Replace all transformer block attentions with flash attention kernel."""
+    compiled_kernel = _build_gpt2attn_flash()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.attn = GPT2AttentionStepWrapper(block.attn, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2Attention blocks with flash attention kernel.")
+
+
 _REPLACEMENT_REGISTRY = {
     "gpt2mlp": _apply_gpt2mlp,              # hand-written scalar MLP (mm + manual loops)
     "gpt2mlp_fused": _apply_gpt2mlp_fused,  # torch::mm matmuls + separate add_ & at::gelu calls
@@ -1691,8 +2677,11 @@ _REPLACEMENT_REGISTRY = {
     "gpt2mlp_fused2": _apply_gpt2mlp_fused2,  # cblas_sgemm matmuls + at::gelu (slower than fused)
     "gpt2mlp_fused3": _apply_gpt2mlp_fused3,  # torch::mm matmuls + single-pass fused bias+GELU loop
     "gpt2mlp_fused4": _apply_gpt2mlp_fused4,  # AVX512+OpenMP hand-written GEMV for M=1 decode
-    "gpt2mlp_fused5": _apply_gpt2mlp_fused5,  # tiled GEMV + Pade-tanh GELU
-    "gpt2mlp_fused6": _apply_gpt2mlp_fused6,  # tiled GEMM + Pade-tanh GELU
+    "gpt2mlp_fused5": _apply_gpt2mlp_fused5,  # tiled GEMV + Pade-tanh GELU + torch::mm
+    "gpt2mlp_fused6": _apply_gpt2mlp_fused6,  # tiled GEMM + Pade-tanh GELU + avx512_omp_gemm
+    "gpt2attn":       _apply_gpt2attn,        # baseline: torch::mm + at::softmax
+    "gpt2attn_fused": _apply_gpt2attn_fused,  # AVX-512 projections + torch softmax
+    "gpt2attn_flash": _apply_gpt2attn_flash,  # full tiled flash attention
 }
 
 
