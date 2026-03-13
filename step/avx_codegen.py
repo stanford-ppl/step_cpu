@@ -30,15 +30,15 @@ from darpa.modified.step_kernels import (
 
 
 class AVXCodegen:
-    """Generates AVX512+OpenMP C++ from a GEMV StepProgram and a GEMM StepProgram."""
+    """Generates AVX512+OpenMP C++ from a decode StepProgram and a prefill StepProgram."""
 
     def __init__(
         self,
-        gemv_program: StepProgram,
-        gemm_program: StepProgram,
+        decode: StepProgram,
+        prefill: StepProgram,
     ):
-        self.gemv = gemv_program
-        self.gemm = gemm_program
+        self.decode = decode
+        self.prefill = prefill
         self.lines: list[str] = []
         self._indent = 0
         self._var_counter = 0
@@ -64,6 +64,141 @@ class AVXCodegen:
         return f"{prefix}_{self._var_counter}"
 
     # ------------------------------------------------------------------
+    # GEMV visitor infrastructure
+    # ------------------------------------------------------------------
+
+    def _get_cpp_ptr(self, buf, ctx: dict) -> str:
+        """Look up the C++ pointer name for a buffer."""
+        return ctx["buf_ptrs"][buf.name]
+
+    def _build_gemv_ctx(self, stage: StepStage) -> dict:
+        """Build visitor context from a GEMV stage."""
+        n_var = stage.dataflow_order[0]
+        k_var = stage.dataflow_order[1]
+        return {
+            "mode": "gemv",
+            "buf_ptrs": {buf.name: key for key, buf in stage.buffers.items()},
+            "RN": n_var.register_block,
+            "VL": n_var.step,
+            "n_loop_var": n_var.name,
+            "k_loop_var": k_var.name,
+            "K_size": "K",
+            "N_size": "N",
+        }
+
+    def _visit(self, op, ctx: dict):
+        """Type dispatcher: route to the appropriate visitor method."""
+        if isinstance(op, LinearLoad):
+            return self._visit_linear_load(op, ctx)
+        elif isinstance(op, BinaryMapAccum):
+            return self._visit_binary_map_accum(op, ctx)
+        elif isinstance(op, LinearStore):
+            return self._visit_linear_store(op, ctx)
+        elif isinstance(op, UnaryMap):
+            return self._visit_unary_map(op, ctx)
+        else:
+            raise ValueError(f"Unknown op type: {type(op)}")
+
+    def _visit_linear_load(self, op, ctx: dict) -> List[str]:
+        """Visit a LinearLoad, emit variables, return names.
+
+        Derives behavior from the buffer's IndexVar steps:
+          - All dims step=1  -> scalar broadcast (_mm512_set1_ps)
+          - Single dim step=VL -> 1D vector load (_mm512_loadu_ps)
+          - Two dims (step=1 + step=VL) -> 2D weight load
+        """
+        buf = op.in_buff
+        cpp_ptr = self._get_cpp_ptr(buf, ctx)
+        prefix = cpp_ptr.lower()
+        RN = ctx["RN"]
+        VL = ctx["VL"]
+        n_var = ctx["n_loop_var"]
+        k_var = ctx["k_loop_var"]
+
+        steps = [iv.step for iv in buf.index_vars]
+
+        if all(s == 1 for s in steps):
+            # Scalar broadcast: __m512 xk = _mm512_set1_ps(x[k]);
+            name = f"{prefix}{k_var}"
+            self._emit(f"__m512 {name} = _mm512_set1_ps({cpp_ptr}[{k_var}]);")
+            return [name]
+        elif len(buf.index_vars) == 1 and steps[0] == VL:
+            # 1D vector load: __m512 bias{r} = _mm512_loadu_ps(bias + n + r*16);
+            var_names = []
+            for r in range(RN):
+                name = f"{prefix}{r}"
+                offset = f"{n_var} + {r * VL}" if r > 0 else n_var
+                self._emit(f"__m512 {name} = _mm512_loadu_ps({cpp_ptr} + {offset});")
+                var_names.append(name)
+            return var_names
+        else:
+            # 2D weight load: __m512 w{r} = _mm512_loadu_ps(W + k * N + n + r*16);
+            N_size = ctx["N_size"]
+            var_names = []
+            for r in range(RN):
+                name = f"{prefix}{r}"
+                offset = (f"{k_var} * {N_size} + {n_var} + {r * VL}"
+                          if r > 0 else f"{k_var} * {N_size} + {n_var}")
+                self._emit(f"__m512 {name} = _mm512_loadu_ps({cpp_ptr} + {offset});")
+                var_names.append(name)
+            return var_names
+
+    def _visit_binary_map_accum(self, op, ctx: dict) -> List[str]:
+        """Visit a BinaryMapAccum: recursive visitation with k-loop."""
+        RN = ctx["RN"]
+        K_size = ctx["K_size"]
+        k_var = ctx["k_loop_var"]
+
+        # Visit init (bias load) — emitted before k-loop
+        init_vars = self._visit(op.init, ctx)
+
+        # Emit acc init
+        acc_vars = []
+        for i in range(RN):
+            acc_name = f"acc{i}"
+            self._emit(f"__m512 {acc_name} = {init_vars[i]};")
+            acc_vars.append(acc_name)
+
+        self._emit("")
+
+        # Open k-loop
+        self._emit(f"for (int64_t {k_var} = 0; {k_var} < {K_size}; {k_var}++) {{")
+        self._indent_inc()
+
+        # Visit in1 (x load — scalar broadcast)
+        in1_vars = self._visit(op.in1, ctx)
+
+        # Visit in2 (W load — vector loads)
+        in2_vars = self._visit(op.in2, ctx)
+
+        # Emit fmadd body
+        for i in range(RN):
+            self._emit(f"{acc_vars[i]} = _mm512_fmadd_ps({in1_vars[0]}, {in2_vars[i]}, {acc_vars[i]});")
+
+        self._indent_dec()
+        self._emit("}")
+        self._emit("")
+
+        return acc_vars
+
+    def _visit_linear_store(self, op, ctx: dict) -> None:
+        """Visit a LinearStore: terminal node, emit stores."""
+        VL = ctx["VL"]
+        n_var = ctx["n_loop_var"]
+        cpp_ptr = self._get_cpp_ptr(op.out_buff, ctx)
+
+        # Visit input — triggers full recursive chain
+        input_vars = self._visit(op.input, ctx)
+
+        # Emit stores
+        for i in range(len(input_vars)):
+            self._emit(f"_mm512_storeu_ps({cpp_ptr} + {n_var} + {i * VL}, {input_vars[i]});")
+
+    def _visit_unary_map(self, op, ctx: dict):
+        """Stub: GELU is emitted at entry-point level, not inside a microkernel."""
+        pass
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
@@ -77,14 +212,14 @@ class AVXCodegen:
         self._emit("")
 
         # GEMV functions
-        for stage in self.gemv.stages:
+        for stage in self.decode.stages:
             if stage.stage_type == "gemv":
                 self._emit_gemv_microkernel(stage)
                 self._emit_omp_gemv_wrapper(stage)
                 break  # all GEMV stages share the same microkernel shape
 
         # GEMM functions
-        for stage in self.gemm.stages:
+        for stage in self.prefill.stages:
             if stage.stage_type == "gemm":
                 self._emit_gemm_microkernel(stage)
                 self._emit_omp_gemm_wrapper(stage)
@@ -172,48 +307,10 @@ class AVXCodegen:
         self._emit(f"for (; n + RN * {VL} <= n_end; n += RN * {VL}) {{")
         self._indent_inc()
 
-        # Visit the ops using recursive visitation.
-        # Find the BinaryMapAccum and LinearStore in stage ops.
-        accum_op = None
-        store_op = None
-        for op in stage.ops:
-            if isinstance(op, BinaryMapAccum):
-                accum_op = op
-            if isinstance(op, LinearStore):
-                store_op = op
-
-        # Phase 1: Emit accum init (visit init -> bias load, before k-loop)
-        init_vars = self._visit_linear_load_gemv(accum_op.init, "n", "bias", RN, VL)
-        # Emit acc = init
-        acc_vars = []
-        for i in range(RN):
-            acc_name = f"acc{i}"
-            self._emit(f"__m512 {acc_name} = {init_vars[i]};")
-            acc_vars.append(acc_name)
-
-        self._emit("")
-
-        # Phase 2: k-loop with in1, in2, fmadd
-        self._emit("for (int64_t k = 0; k < K; k++) {")
-        self._indent_inc()
-
-        # Visit in1 (x load — scalar broadcast)
-        in1_vars = self._visit_linear_load_gemv(accum_op.in1, "k", "x", 1, 1, scalar=True)
-
-        # Visit in2 (W load — vector loads)
-        in2_vars = self._visit_linear_load_gemv(accum_op.in2, "n", "W", RN, VL, weight=True)
-
-        # Emit fmadd body
-        for i in range(RN):
-            self._emit(f"{acc_vars[i]} = _mm512_fmadd_ps({in1_vars[0]}, {in2_vars[i]}, {acc_vars[i]});")
-
-        self._indent_dec()
-        self._emit("}")
-        self._emit("")
-
-        # Phase 3: Store (after k-loop)
-        for i in range(RN):
-            self._emit(f"_mm512_storeu_ps(y + n + {i * VL}, {acc_vars[i]});")
+        # Recursive visitation: LinearStore -> BinaryMapAccum -> LinearLoads
+        ctx = self._build_gemv_ctx(stage)
+        store_op = next(op for op in stage.ops if isinstance(op, LinearStore))
+        self._visit(store_op, ctx)
 
         self._indent_dec()
         self._emit("}")
@@ -221,71 +318,37 @@ class AVXCodegen:
         self._indent_dec()
         self._emit("}")
         self._emit("")
-
-    def _visit_linear_load_gemv(
-        self, op: LinearLoad, loop_var: str, buf_name: str,
-        RN: int, VL: int, scalar: bool = False, weight: bool = False,
-    ) -> List[str]:
-        """Visit a LinearLoad for GEMV, emit variables, return names.
-
-        Determines intrinsic from the buffer's IndexVar step:
-          step=1  -> _mm512_set1_ps (scalar broadcast)
-          step=16 -> _mm512_loadu_ps (vector load)
-        """
-        var_names = []
-        if scalar:
-            # Scalar broadcast: __m512 xk = _mm512_set1_ps(x[k]);
-            name = f"{buf_name}k"
-            self._emit(f"__m512 {name} = _mm512_set1_ps({buf_name}[k]);")
-            var_names.append(name)
-        elif weight:
-            # Weight vector load: W + k * N + n + r*16
-            for r in range(RN):
-                name = f"w{r}"
-                offset = f"k * N + n + {r * VL}" if r > 0 else "k * N + n"
-                self._emit(f"__m512 {name} = _mm512_loadu_ps(W + {offset});")
-                var_names.append(name)
-        else:
-            # Bias/output vector load: ptr + n + r*16
-            for r in range(RN):
-                name = f"{buf_name}{r}"
-                offset = f"n + {r * VL}" if r > 0 else "n"
-                self._emit(f"__m512 {name} = _mm512_loadu_ps({buf_name} + {offset});")
-                var_names.append(name)
-        return var_names
 
     # ------------------------------------------------------------------
     # OpenMP GEMV wrapper
     # ------------------------------------------------------------------
 
     def _emit_omp_gemv_wrapper(self, stage: StepStage) -> None:
-        """Emit avx512_omp_gemv with 16-aligned chunk partitioning."""
+        """Emit avx512_omp_gemv with tile-aligned chunk partitioning."""
+        dataflow = stage.dataflow_order  # [n, k]
+        n_var = dataflow[0]
+        RN = n_var.register_block
+        VL = n_var.step  # 16
+        TILE = RN * VL  # 64 — minimum chunk per thread
+
         self._emit("// OpenMP parallel GEMV: y[0..N) = x[0..K) * W[K,N] + bias[0..N)")
         self._emit("static void avx512_omp_gemv(const float* x, const float* W, const float* bias,")
         self._emit("                            float* y, int64_t K, int64_t N) {")
         self._indent_inc()
+        self._emit(f"constexpr int64_t TILE = {TILE};  // RN * VL")
+        self._emit("int64_t ntiles = N / TILE;")
         self._emit("#pragma omp parallel")
         self._emit("{")
         self._indent_inc()
         self._emit("int nthreads = omp_get_num_threads();")
         self._emit("int tid = omp_get_thread_num();")
-        self._emit("// Partition N into 16-aligned chunks")
-        self._emit("int64_t base_chunk = (N / nthreads) & ~15LL;")
-        self._emit("int64_t remainder = N - base_chunk * nthreads;")
-        self._emit("int64_t n_start, n_end;")
-        self._emit("if (tid < remainder / 16) {")
-        self._indent_inc()
-        self._emit("int64_t my_chunk = base_chunk + 16;")
-        self._emit("n_start = tid * my_chunk;")
-        self._emit("n_end = n_start + my_chunk;")
-        self._indent_dec()
-        self._emit("} else {")
-        self._indent_inc()
-        self._emit("n_start = (remainder / 16) * (base_chunk + 16) + (tid - remainder / 16) * base_chunk;")
-        self._emit("n_end = n_start + base_chunk;")
-        self._indent_dec()
-        self._emit("}")
-        self._emit("if (n_end > N) n_end = N;")
+        self._emit("// Distribute tiles evenly; excess threads idle")
+        self._emit("int64_t tiles_per = ntiles / nthreads;")
+        self._emit("int64_t extra = ntiles % nthreads;")
+        self._emit("int64_t my_tiles = tiles_per + (tid < extra ? 1 : 0);")
+        self._emit("int64_t n_start = (tid < extra ? tid * (tiles_per + 1)")
+        self._emit("                               : extra * (tiles_per + 1) + (tid - extra) * tiles_per) * TILE;")
+        self._emit("int64_t n_end = n_start + my_tiles * TILE;")
         self._emit("if (n_start < n_end) {")
         self._indent_inc()
         self._emit("gemv_tiled_chunk(x, W, bias, y, K, N, n_start, n_end);")
@@ -525,7 +588,7 @@ class AVXCodegen:
 
     def _emit_entry_point(self) -> None:
         """Emit the main function: dispatch M==1 (GEMV) vs M>1 (GEMM)."""
-        prog = self.gemv  # use GEMV program for signature (same params)
+        prog = self.decode  # use GEMV program for signature (same params)
         func_name = prog.name + "_step"
         params = ", ".join(f"torch::Tensor {p}" for p in prog.tensor_params)
 
@@ -561,7 +624,7 @@ class AVXCodegen:
     def _emit_gemv_path(self) -> None:
         """Emit the M==1 GEMV path body inside the entry point."""
         # Dimension extraction from dim_bindings
-        for dim_name, (tensor_param, dim_idx) in self.gemv.dim_bindings.items():
+        for dim_name, (tensor_param, dim_idx) in self.decode.dim_bindings.items():
             self._emit(f"const int64_t {dim_name} = {tensor_param}.size({dim_idx});")
         self._emit("")
 
@@ -574,7 +637,7 @@ class AVXCodegen:
         self._emit("")
 
         # Walk GEMV stages sequentially
-        for i, stage in enumerate(self.gemv.stages):
+        for i, stage in enumerate(self.decode.stages):
             if stage.stage_type == "gemv":
                 if i == 0:
                     # GEMV1: h = x * W_fc + b_fc
@@ -600,7 +663,7 @@ class AVXCodegen:
         """Emit the M>1 GEMM path body inside the entry point."""
         self._emit("// M > 1 (prefill) — AVX512 GEMM with fused bias")
         # Dimension extraction
-        for dim_name, (tensor_param, dim_idx) in self.gemm.dim_bindings.items():
+        for dim_name, (tensor_param, dim_idx) in self.prefill.dim_bindings.items():
             if dim_name == "M":
                 continue  # already extracted above
             self._emit(f"const int64_t {dim_name} = {tensor_param}.size({dim_idx});")
@@ -615,7 +678,7 @@ class AVXCodegen:
         self._emit("")
 
         # Walk GEMM stages sequentially
-        for i, stage in enumerate(self.gemm.stages):
+        for i, stage in enumerate(self.prefill.stages):
             if stage.stage_type == "gemm":
                 if i == 0:
                     self._emit("// GEMM1: h = hidden_states * W_fc + b_fc")
@@ -640,7 +703,7 @@ class AVXCodegen:
     # ------------------------------------------------------------------
 
     def _emit_registration(self) -> None:
-        func_name = self.gemv.name + "_step"
+        func_name = self.decode.name + "_step"
         self._emit("TORCH_LIBRARY_FRAGMENT(step_ops, m) {")
         self._indent_inc()
         self._emit(f'm.def("{func_name}", {func_name});')

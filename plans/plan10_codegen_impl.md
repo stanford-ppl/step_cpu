@@ -194,9 +194,9 @@ Plan: AVX512+OpenMP Code Generator for STeP GPT2 MLP                            
 
 ---
 
-## Step 3: Update `step/compile.py` - AVX512 flags
+## Step 3: Update `step/compile.py` - AVX512 flags (DONE)
 
-Add `avx512: bool = False` parameter to `build_extension()`. When True, append:
+Added `avx512: bool = False` parameter to `build_extension()`. When True, appends:
 ```python
 extra_cflags += ["-march=native", "-fopenmp", "-mavx512f", "-mfma"]
 extra_ldflags += ["-fopenmp"]
@@ -204,9 +204,9 @@ extra_ldflags += ["-fopenmp"]
 
 ---
 
-## Step 4: Update `darpa/modified/causal_language_modeling_mlp.py` - Wire codegen
+## Step 4: Update `darpa/modified/causal_language_modeling_mlp.py` - Wire codegen (DONE)
 
-Replace the hardcoded `_FUSED6_CPP_SOURCE` string in `_build_gpt2mlp_fused6()` with:
+Replaced the hardcoded `_FUSED6_CPP_SOURCE` string in `_build_gpt2mlp_fused6()` with:
 ```python
 def _build_gpt2mlp_fused6():
     from step.avx_codegen import AVXCodegen
@@ -222,7 +222,19 @@ def _build_gpt2mlp_fused6():
 
 ---
 
-## Step 5: Add tests
+## Step 5: Add tests (DONE)
+
+### Integration test in Docker — verified:
+
+- C++ compiles without errors (269 lines, 10761 chars)
+- Inference output matches baseline: "Why is the sky blue? It's a question that has been answered for years..."
+- Generated C++ contains: GEMV/GEMM kernels, fast_tanh GELU, M==1 dispatch, TORCH_LIBRARY_FRAGMENT
+- codegen.generate() takes 0.08 ms
+- Numerical accuracy: max diff ~1e-3 per layer vs torch.mm reference (fp32 tolerance)
+
+### Bug found & fixed:
+
+GEMV OpenMP partitioning allocated 16-element chunks, but `gemv_tiled_chunk` requires 64-element (RN*VL) tiles. With 24 threads and N=768, each thread got only 32 elements — too small for a single tile, leaving output uninitialized. Fixed by partitioning at tile granularity (64 elements) so excess threads idle instead.
 
 ### `tests/test_avx_codegen.py` - Unit tests on generated C++ string
 
@@ -231,14 +243,6 @@ def _build_gpt2mlp_fused6():
 - **TestAVXCodegenGEMM**: Verify template, 2D acc array, instantiations
 - **TestAVXCodegenGELU**: Verify constants, fast_tanh call, parallel for
 - **TestAVXCodegenEntryPoint**: Verify M==1 branch, dim extraction, contiguity checks
-
-### Integration test in Docker:
-```bash
-docker exec -it mocha-bg bash
-source /home/dockeruser/mochaenv/bin/activate
-cd /home/dockeruser/step_cpu
-python3 darpa/modified/causal_language_modeling_mlp.py --mode infer --prompt "Why is the sky blue?" --cpu-only --replace gpt2mlp_fused6
-```
 
 ---
 
@@ -284,3 +288,23 @@ For BinaryMapAccum with rank=r:
 - body operands: placed INSIDE the inner r-th loop
 - result: available AFTER the inner r-th loop closes
 - LinearStore consuming result: placed after the inner loop closes
+ 
+
+## How to Run
+
+Enter the container
+```
+  docker exec -it mocha-bg bash -c 
+```
+In the container:
+```
+source /home/dockeruser/mochaenv/bin/activate
+cd /home/dockeruser/step_cpu
+PYTHONPATH=/home/dockeruser/step_cpu:\$PYTHONPATH \
+python3 darpa/modified/causal_language_modeling_mlp.py --mode infer --prompt 'Why is the sky blue?' --cpu-only --replace gpt2mlp_fused6
+```
+
+
+ ## To read the generated Cpp file
+ Inside the container at:
+`/root/.cache/mocha/gpt2_mlp_fused6/gpt2_mlp_fused6_step.cpp`

@@ -11,11 +11,16 @@ import torch
 import torch.utils.cpp_extension
 
 
-def build_extension(func_name: str, cpp_source: str) -> Callable:
+def build_extension(func_name: str, cpp_source: str, avx512: bool = False) -> Callable:
     """Compile a C++ source string into a loaded PyTorch extension.
 
     Uses torch.utils.cpp_extension.load() with source-hash caching.
     Returns a callable that dispatches to torch.ops.step_ops.<func_name>_step.
+
+    Args:
+        func_name: Base name for the generated op (e.g., "gpt2_mlp_fused6").
+        cpp_source: The C++ source string to compile.
+        avx512: If True, add AVX512+OpenMP compilation flags.
     """
     op_name = func_name + "_step"
 
@@ -26,12 +31,19 @@ def build_extension(func_name: str, cpp_source: str) -> Callable:
     cpp_path = cache_dir / f"{op_name}.cpp"
     cpp_path.write_text(cpp_source)
 
+    extra_cflags = ["-O3", "-std=c++17"]
+    extra_ldflags = []
+    if avx512:
+        extra_cflags += ["-march=native", "-fopenmp", "-mavx512f", "-mfma"]
+        extra_ldflags += ["-fopenmp"]
+
     # Compile — is_python_module=False because we use TORCH_LIBRARY_FRAGMENT
     # which registers ops via torch.ops rather than exporting a Python module.
     torch.utils.cpp_extension.load(
         name=f"step_{func_name}",
         sources=[str(cpp_path)],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
         build_directory=str(cache_dir),
         verbose=False,
         is_python_module=False,
