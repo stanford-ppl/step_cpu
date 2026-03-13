@@ -231,6 +231,40 @@ class AVXCodegen:
 
         return "\n".join(self.lines) + "\n"
 
+    def generate_kernels_only(self, extra_includes: list[str] | None = None) -> str:
+        """Generate only kernel functions (GEMV + GEMM), no entry point or registration.
+
+        Used when the entry point will be provided as a hardcoded C++ string
+        (e.g., attention kernel with custom inner logic).
+        """
+        self.lines = []
+        self._indent = 0
+        self._var_counter = 0
+
+        self._emit_includes()
+        if extra_includes:
+            for inc in extra_includes:
+                self._emit(inc)
+            self._emit("")
+        self._emit_fast_tanh()
+        self._emit("")
+
+        # GEMV functions
+        for stage in self.decode.stages:
+            if stage.stage_type == "gemv":
+                self._emit_gemv_microkernel(stage)
+                self._emit_omp_gemv_wrapper(stage)
+                break
+
+        # GEMM functions
+        for stage in self.prefill.stages:
+            if stage.stage_type == "gemm":
+                self._emit_gemm_microkernel(stage)
+                self._emit_omp_gemm_wrapper(stage)
+                break
+
+        return "\n".join(self.lines) + "\n"
+
     # ------------------------------------------------------------------
     # Includes
     # ------------------------------------------------------------------

@@ -386,8 +386,230 @@ def _apply_gpt2mlp_fused6(model):
     )
 
 
+# --------------------------------------------------------------
+#  GPT2Attention STeP codegen replacement
+# --------------------------------------------------------------
+
+
+class GPT2AttentionStepWrapper(torch.nn.Module):
+    """Drop-in replacement for GPT2Attention using a STeP-compiled C++ kernel.
+
+    In eval mode, uses the compiled kernel for inference.
+    In training mode, falls through to the original HuggingFace forward.
+    """
+
+    def __init__(self, attn_module, compiled_kernel):
+        super().__init__()
+        self.c_attn = attn_module.c_attn       # Conv1D(768, 2304) — QKV projection
+        self.c_proj = attn_module.c_proj        # Conv1D(768, 768) — output projection
+        self.attn_dropout = attn_module.attn_dropout
+        self.resid_dropout = attn_module.resid_dropout
+        self.num_heads = attn_module.num_heads  # 12
+        self.head_dim = attn_module.head_dim    # 64
+        self.embed_dim = attn_module.embed_dim  # 768
+        self.scale_attn_weights = attn_module.scale_attn_weights
+        self.layer_idx = attn_module.layer_idx
+        self._compiled_kernel = compiled_kernel
+        self._original_attn = attn_module       # training fallback
+
+    def forward(self, hidden_states, past_key_values=None, cache_position=None,
+                attention_mask=None, head_mask=None,
+                encoder_hidden_states=None, encoder_attention_mask=None,
+                output_attentions=False, **kwargs):
+        if self.training:
+            return self._original_attn(
+                hidden_states, past_key_values=past_key_values,
+                cache_position=cache_position,
+                attention_mask=attention_mask, head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions, **kwargs,
+            )
+
+        # Eval path: call C++ kernel
+        shape = hidden_states.shape  # [B, S, 768]
+        B = shape[0]
+        S = shape[1]
+        x2d = hidden_states.reshape(B * S, self.embed_dim).contiguous()
+
+        # Extract past key/value from Cache object (empty tensors if no cache)
+        past_key = torch.empty(0)
+        past_value = torch.empty(0)
+        if past_key_values is not None and past_key_values.get_seq_length(self.layer_idx) > 0:
+            # Cache stores [B, num_heads, seq_len, head_dim]
+            past_key = past_key_values.layers[self.layer_idx].keys
+            past_value = past_key_values.layers[self.layer_idx].values
+
+        # Prepare attention mask (empty if None)
+        if attention_mask is not None:
+            attn_mask = attention_mask.contiguous()
+        else:
+            attn_mask = torch.empty(0)
+
+        # C++ kernel returns [output, present_key, present_value]
+        result = self._compiled_kernel(
+            x2d,
+            self.c_attn.weight,
+            self.c_attn.bias,
+            self.c_proj.weight,
+            self.c_proj.bias,
+            past_key,
+            past_value,
+            attn_mask,
+            self.num_heads,
+            B,
+        )
+
+        attn_output = result[0].reshape(shape)
+        new_key = result[1]   # [B, num_heads, total_len, head_dim]
+        new_value = result[2]
+
+        # Update the Cache object with the full key/value (overwrite previous)
+        if past_key_values is not None:
+            # We need to set the cache directly since our kernel already concatenated
+            # Ensure the cache has enough layers
+            while len(past_key_values.layers) <= self.layer_idx:
+                past_key_values.layers.append(past_key_values.layer_class_to_replicate())
+            layer = past_key_values.layers[self.layer_idx]
+            if not layer.is_initialized:
+                layer.lazy_initialization(new_key)
+            layer.keys = new_key
+            layer.values = new_value
+
+        # Return format matching GPT2Attention: (attn_output, attn_weights)
+        return attn_output, None
+
+
+_ATTN_ENTRY_POINT_CPP = r"""
+std::vector<torch::Tensor> gpt2_attn_codegen_step(
+    torch::Tensor x,
+    torch::Tensor W_attn,
+    torch::Tensor b_attn,
+    torch::Tensor W_proj,
+    torch::Tensor b_proj,
+    torch::Tensor past_key,
+    torch::Tensor past_value,
+    torch::Tensor attn_mask,
+    int64_t num_heads,
+    int64_t batch_size
+) {
+    const int64_t M = x.size(0);
+    const int64_t embed_dim = x.size(1);
+    const int64_t head_dim = embed_dim / num_heads;
+    const int64_t S = M / batch_size;
+
+    // 1. QKV projection with AVX-512 GEMM/GEMV
+    auto qkv = torch::empty({M, 3 * embed_dim}, x.options());
+    if (M == 1) {
+        avx512_omp_gemv(x.data_ptr<float>(), W_attn.data_ptr<float>(),
+                        b_attn.data_ptr<float>(), qkv.data_ptr<float>(),
+                        embed_dim, 3 * embed_dim);
+    } else {
+        avx512_omp_gemm(x.data_ptr<float>(), W_attn.data_ptr<float>(),
+                        b_attn.data_ptr<float>(), qkv.data_ptr<float>(),
+                        M, embed_dim, 3 * embed_dim);
+    }
+
+    // 2. Split Q, K, V
+    auto qkv_split = qkv.chunk(3, 1);
+    auto Q = qkv_split[0].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto K = qkv_split[1].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto V = qkv_split[2].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+
+    // 3. Concatenate past KV
+    bool has_past = past_key.numel() > 0;
+    if (has_past) {
+        K = torch::cat({past_key, K}, 2);
+        V = torch::cat({past_value, V}, 2);
+    }
+
+    auto present_key = K.clone();
+    auto present_value = V.clone();
+
+    const int64_t total_len = K.size(2);
+
+    // 4. Attention scores (still using torch ops for inner attention)
+    auto K_t = K.transpose(-2, -1).contiguous();
+    auto scores = torch::matmul(Q.contiguous(), K_t);
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    scores.mul_(scale);
+
+    // 5. Causal mask
+    {
+        auto causal = torch::full({S, total_len}, -1e4, scores.options());
+        for (int64_t i = 0; i < S; i++) {
+            int64_t max_pos = total_len - S + i;
+            for (int64_t j = 0; j <= max_pos && j < total_len; j++) {
+                causal[i][j] = 0.0f;
+            }
+        }
+        scores.add_(causal.unsqueeze(0).unsqueeze(0));
+    }
+
+    // 6. Add HF mask
+    if (attn_mask.numel() > 0) scores.add_(attn_mask);
+
+    // 7. Softmax
+    auto attn_weights = at::softmax(scores, -1);
+
+    // 8. Context
+    auto context = torch::matmul(attn_weights, V.contiguous());
+    auto merged = context.permute({0, 2, 1, 3}).contiguous().reshape({M, embed_dim});
+
+    // 9. Output projection with AVX-512
+    auto output = torch::empty({M, embed_dim}, x.options());
+    if (M == 1) {
+        avx512_omp_gemv(merged.data_ptr<float>(), W_proj.data_ptr<float>(),
+                        b_proj.data_ptr<float>(), output.data_ptr<float>(),
+                        embed_dim, embed_dim);
+    } else {
+        avx512_omp_gemm(merged.data_ptr<float>(), W_proj.data_ptr<float>(),
+                        b_proj.data_ptr<float>(), output.data_ptr<float>(),
+                        M, embed_dim, embed_dim);
+    }
+
+    return {output, present_key, present_value};
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_attn_codegen_step", gpt2_attn_codegen_step);
+}
+"""
+
+
+def _build_gpt2attn_codegen():
+    """Compile the codegen'd AVX-512 GPT2Attention kernel from STeP programs."""
+    from step.avx_codegen import AVXCodegen
+    from step.compile import build_extension
+    from darpa.modified.step_kernels import (
+        build_gpt2_attn_gemv_program,
+        build_gpt2_attn_gemm_program,
+    )
+
+    print("Building codegen'd AVX-512 GPT2Attention kernel from STeP programs...")
+
+    gemv = build_gpt2_attn_gemv_program()
+    gemm = build_gpt2_attn_gemm_program()
+    codegen = AVXCodegen(decode=gemv, prefill=gemm)
+    kernel_cpp = codegen.generate_kernels_only(extra_includes=["#include <limits>"])
+    cpp_source = kernel_cpp + _ATTN_ENTRY_POINT_CPP
+    return build_extension("gpt2_attn_codegen", cpp_source, avx512=True)
+
+
+def _apply_gpt2attn_codegen(model):
+    """Replace all transformer block attentions with codegen'd GPT2AttentionStepWrapper."""
+    compiled_kernel = _build_gpt2attn_codegen()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.attn = GPT2AttentionStepWrapper(block.attn, compiled_kernel)
+    print(
+        f"Replaced {len(blocks)} GPT2Attention blocks with codegen'd AVX-512 kernel."
+    )
+
+
 _REPLACEMENT_REGISTRY = {
     "gpt2mlp_fused6": _apply_gpt2mlp_fused6,
+    "gpt2attn_codegen": _apply_gpt2attn_codegen,
 }
 
 
@@ -459,8 +681,8 @@ def parse_clm(args):
         metavar="MODULE",
         help=(
             "Replace named model submodules with STeP-compiled kernels. "
-            "Supported: gpt2mlp_fused6. "
-            "Example: --replace gpt2mlp_fused6"
+            "Supported: gpt2mlp_fused6, gpt2attn_codegen. "
+            "Example: --replace gpt2mlp_fused6 gpt2attn_codegen"
         ),
     )
     return parser.parse_args(args)

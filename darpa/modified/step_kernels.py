@@ -584,6 +584,62 @@ def build_gpt2_mlp_gemm_program() -> StepProgram:
 
 
 # ============================================================
+# GPT2 Attention: single-stage GEMV/GEMM programs
+# ============================================================
+
+
+def build_gpt2_attn_gemv_program() -> StepProgram:
+    """Build single-stage GEMV program for attention projections.
+
+    A single GEMV stage: y[N] = x[K] @ W[K,N] + bias[N].
+    Used by AVXCodegen.generate_kernels_only() to emit the GEMV
+    microkernel + OMP wrapper for the attention codegen path.
+    """
+    program = StepProgram(
+        name="gpt2_attn_codegen",
+        tensor_params=["x", "W", "bias", "y"],
+        dim_bindings={"D": ("x", 1), "N": ("W", 1)},
+    )
+
+    n = IndexVar("n", size="N", step=16, parallelized=True, register_block=4)
+    k = IndexVar("k", size="D", step=1)
+
+    x_buf = Buffer([k], name="x")
+    w_buf = Buffer([k, n], name="W")
+    bias_buf = Buffer([n], name="bias")
+    out_buf = Buffer([n], name="y")
+
+    program.stages.append(_build_gemv_stage(x_buf, w_buf, bias_buf, out_buf, n, k))
+    return program
+
+
+def build_gpt2_attn_gemm_program() -> StepProgram:
+    """Build single-stage GEMM program for attention projections.
+
+    A single GEMM stage: C[M,N] = A[M,K] @ W[K,N] + bias[N].
+    Used by AVXCodegen.generate_kernels_only() to emit the GEMM
+    microkernel + OMP wrapper for the attention codegen path.
+    """
+    program = StepProgram(
+        name="gpt2_attn_codegen",
+        tensor_params=["A", "W", "bias", "C"],
+        dim_bindings={"M": ("A", 0), "D": ("A", 1), "N": ("W", 1)},
+    )
+
+    m = IndexVar("m", size="M", step=1, parallelized=True, register_block=4)
+    n = IndexVar("n", size="N", step=16, register_block=4)
+    k = IndexVar("k", size="D", step=1)
+
+    a_buf = Buffer([m, k], name="x")
+    w_buf = Buffer([k, n], name="W")
+    bias_buf = Buffer([n], name="bias")
+    out_buf = Buffer([m, n], name="C")
+
+    program.stages.append(_build_gemm_stage(a_buf, w_buf, bias_buf, out_buf, m, n, k))
+    return program
+
+
+# ============================================================
 # GPT2MLPStepWrapper (kept from causal_language_modeling_mlp.py
 # for reference; the actual runtime wrapper lives there)
 # ============================================================
