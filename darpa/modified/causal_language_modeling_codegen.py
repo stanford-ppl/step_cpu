@@ -8,6 +8,7 @@
 # --------------------------------------------------------------
 
 import argparse
+import csv
 import os
 import math
 import sys
@@ -62,6 +63,27 @@ def load_small_eli5(num_examples: int = 200, test_frac: float = 0.1):
     test_size = max(1, int(num_examples * test_frac))
     split = raw.train_test_split(test_size=test_size, seed=42)
     return split.flatten()
+
+
+def find_eli5_question_by_length(tok, target_len):
+    """Select the ELI5 question whose token count is closest to *target_len*.
+
+    Loads 100 examples from ``test[100:200]`` (matching ``inspect_eli5.py``),
+    combines ``title`` + ``selftext`` for each, tokenizes, and returns the
+    closest match.
+
+    Returns ``(prompt_text, actual_token_count, dataset_index)``.
+    """
+    ds = load_dataset("dany0407/eli5_category", split="test[100:200]")
+    best_text, best_count, best_idx = None, None, None
+    for i, example in enumerate(ds):
+        title = example["title"] or ""
+        selftext = example["selftext"] or ""
+        text = (title + " " + selftext).strip()
+        n_tokens = len(tok(text, add_special_tokens=False)["input_ids"])
+        if best_count is None or abs(n_tokens - target_len) < abs(best_count - target_len):
+            best_text, best_count, best_idx = text, n_tokens, i
+    return best_text, best_count, best_idx
 
 
 # --------------------------------------------------------------
@@ -523,24 +545,25 @@ std::vector<torch::Tensor> gpt2_attn_codegen_step(
         V = torch::cat({past_value, V}, 2);
     }
 
-    auto present_key = K.clone();
-    auto present_value = V.clone();
+    auto present_key = has_past ? K.clone() : K;
+    auto present_value = has_past ? V.clone() : V;
 
     const int64_t total_len = K.size(2);
 
-    // 4. Attention scores (still using torch ops for inner attention)
+    // 4. Attention scores
     auto K_t = K.transpose(-2, -1).contiguous();
     auto scores = torch::matmul(Q.contiguous(), K_t);
     float scale = 1.0f / std::sqrt((float)head_dim);
     scores.mul_(scale);
 
-    // 5. Causal mask
+    // 5. Causal mask (raw pointer, upper-triangle only)
     {
-        auto causal = torch::full({S, total_len}, -1e4, scores.options());
+        auto causal = torch::zeros({S, total_len}, scores.options());
+        float* mask_ptr = causal.data_ptr<float>();
         for (int64_t i = 0; i < S; i++) {
-            int64_t max_pos = total_len - S + i;
-            for (int64_t j = 0; j <= max_pos && j < total_len; j++) {
-                causal[i][j] = 0.0f;
+            int64_t fill_start = total_len - S + i + 1;
+            for (int64_t j = fill_start; j < total_len; j++) {
+                mask_ptr[i * total_len + j] = -1e4f;
             }
         }
         scores.add_(causal.unsqueeze(0).unsqueeze(0));
@@ -577,6 +600,113 @@ TORCH_LIBRARY_FRAGMENT(step_ops, m) {
 """
 
 
+def _build_gpt2attn():
+    """Compile the baseline GPT2Attention C++ kernel (torch::mm + at::softmax)."""
+    from step.compile import build_extension
+
+    print("Building baseline GPT2Attention C++ kernel...")
+
+    cpp_source = r"""
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <cmath>
+#include <limits>
+
+std::vector<torch::Tensor> gpt2_attn_step(
+    torch::Tensor x,          // [M, 768]  (M = B*S)
+    torch::Tensor W_attn,     // [768, 2304]
+    torch::Tensor b_attn,     // [2304]
+    torch::Tensor W_proj,     // [768, 768]
+    torch::Tensor b_proj,     // [768]
+    torch::Tensor past_key,   // [B, 12, past_len, 64] or empty
+    torch::Tensor past_value, // [B, 12, past_len, 64] or empty
+    torch::Tensor attn_mask,  // [B, 1, 1, total_len] or empty
+    int64_t num_heads,        // 12
+    int64_t batch_size        // B
+) {
+    const int64_t M = x.size(0);
+    const int64_t embed_dim = x.size(1);       // 768
+    const int64_t head_dim = embed_dim / num_heads;  // 64
+    const int64_t S = M / batch_size;
+
+    // 1. QKV projection: qkv = x @ W_attn + b_attn -> [M, 2304]
+    auto qkv = torch::mm(x, W_attn);
+    qkv.add_(b_attn);
+
+    // 2. Split Q, K, V each [M, 768], reshape to [B, 12, S, 64]
+    auto qkv_split = qkv.chunk(3, /*dim=*/1);
+    auto Q = qkv_split[0].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto K = qkv_split[1].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+    auto V = qkv_split[2].reshape({batch_size, S, num_heads, head_dim}).permute({0, 2, 1, 3});
+
+    // 3. Concatenate past K, V along dim=2 if provided
+    bool has_past = past_key.numel() > 0;
+    if (has_past) {
+        K = torch::cat({past_key, K}, /*dim=*/2);
+        V = torch::cat({past_value, V}, /*dim=*/2);
+    }
+
+    auto present_key = has_past ? K.clone() : K;
+    auto present_value = has_past ? V.clone() : V;
+
+    const int64_t total_len = K.size(2);
+
+    // 4. scores = Q @ K^T * (1/sqrt(64)) -> [B, 12, S, total_len]
+    auto K_t = K.transpose(-2, -1).contiguous();
+    auto scores = torch::matmul(Q.contiguous(), K_t);
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    scores.mul_(scale);
+
+    // 5. Causal mask (raw pointer, upper-triangle only)
+    {
+        auto causal = torch::zeros({S, total_len}, scores.options());
+        float* mask_ptr = causal.data_ptr<float>();
+        for (int64_t i = 0; i < S; i++) {
+            int64_t fill_start = total_len - S + i + 1;
+            for (int64_t j = fill_start; j < total_len; j++) {
+                mask_ptr[i * total_len + j] = -1e4f;
+            }
+        }
+        scores.add_(causal.unsqueeze(0).unsqueeze(0));
+    }
+
+    // 6. Add HuggingFace attention_mask if provided
+    if (attn_mask.numel() > 0) {
+        scores.add_(attn_mask);
+    }
+
+    // 7. Softmax
+    auto attn_weights = at::softmax(scores, /*dim=*/-1);
+
+    // 8. context = attn_weights @ V -> [B, 12, S, 64]
+    auto context = torch::matmul(attn_weights, V.contiguous());
+
+    // 9. Merge heads -> [M, 768]
+    auto merged = context.permute({0, 2, 1, 3}).contiguous().reshape({M, embed_dim});
+
+    // 10. Output projection: output = merged @ W_proj + b_proj
+    auto output = torch::mm(merged, W_proj);
+    output.add_(b_proj);
+
+    return {output, present_key, present_value};
+}
+
+TORCH_LIBRARY_FRAGMENT(step_ops, m) {
+    m.def("gpt2_attn_step", gpt2_attn_step);
+}
+"""
+    return build_extension("gpt2_attn", cpp_source, avx512=False)
+
+
+def _apply_gpt2attn(model):
+    """Replace all transformer block attentions with baseline GPT2AttentionStepWrapper."""
+    compiled_kernel = _build_gpt2attn()
+    blocks = model.transformer.h
+    for i, block in enumerate(blocks):
+        block.attn = GPT2AttentionStepWrapper(block.attn, compiled_kernel)
+    print(f"Replaced {len(blocks)} GPT2Attention blocks with baseline C++ kernel.")
+
+
 def _build_gpt2attn_codegen():
     """Compile the codegen'd AVX-512 GPT2Attention kernel from STeP programs."""
     from step.avx_codegen import AVXCodegen
@@ -609,6 +739,7 @@ def _apply_gpt2attn_codegen(model):
 
 _REPLACEMENT_REGISTRY = {
     "gpt2mlp_fused6": _apply_gpt2mlp_fused6,
+    "gpt2attn": _apply_gpt2attn,
     "gpt2attn_codegen": _apply_gpt2attn_codegen,
 }
 
@@ -661,7 +792,7 @@ def parse_clm(args):
         "--prompt",
         type=str,
         default=None,
-        help="Input prompt for inference mode (required when --mode infer).",
+        help="Input prompt for inference mode (required unless --seq-len is given).",
     )
     parser.add_argument(
         "--model-path",
@@ -681,8 +812,30 @@ def parse_clm(args):
         metavar="MODULE",
         help=(
             "Replace named model submodules with STeP-compiled kernels. "
-            "Supported: gpt2mlp_fused6, gpt2attn_codegen. "
+            "Supported: gpt2mlp_fused6, gpt2attn, gpt2attn_codegen. "
             "Example: --replace gpt2mlp_fused6 gpt2attn_codegen"
+        ),
+    )
+    parser.add_argument(
+        "--save-csv",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Save inference benchmark metrics to a CSV file.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=20,
+        help="Maximum number of tokens to generate in inference mode (default: 20).",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help=(
+            "Target sequence length for inference; selects an ELI5 question "
+            "with similar token count. Ignored if --prompt is also provided."
         ),
     )
     return parser.parse_args(args)
@@ -728,9 +881,14 @@ def main(args=None):
     # Inference mode
     # --------------------------------------------------------------
     if args.mode == "infer":
-        if args.prompt is None:
-            print("Error: --prompt is required when --mode infer")
+        if args.prompt is None and args.seq_len is None:
+            print("Error: --prompt or --seq-len is required when --mode infer")
             return BenchmarkResult(perplexity=None, elapsed_time=0.0)
+
+        if args.prompt is not None and args.seq_len is not None:
+            print("Note: --seq-len is ignored because --prompt was provided")
+
+        prompt_text = args.prompt  # may be None; resolved after tokenizer creation
 
         # Try to load fine‑tuned weights; fall back to the base model.
         use_finetuned = os.path.isdir(args.model_path) and os.path.isfile(
@@ -747,6 +905,15 @@ def main(args=None):
             tokenizer = AutoTokenizer.from_pretrained(model_id)
             tokenizer.pad_token = tokenizer.eos_token
 
+        if prompt_text is None and args.seq_len is not None:
+            prompt_text, actual_len, ds_idx = find_eli5_question_by_length(
+                tokenizer, args.seq_len
+            )
+            print(
+                f"Selected ELI5 question index {ds_idx} "
+                f"({actual_len} tokens, target {args.seq_len})"
+            )
+
         with TimerClass("load_model", records):
             model = AutoModelForCausalLM.from_pretrained(model_id)
             device = torch.device("cpu")
@@ -761,7 +928,8 @@ def main(args=None):
         model.eval()
 
         with TimerClass("tokenize_prompt", records):
-            inputs = tokenizer(args.prompt, return_tensors="pt")
+            inputs = tokenizer(prompt_text, return_tensors="pt")
+            prompt_token_len = inputs["input_ids"].shape[1]
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
         with TimerClass("generate", records):
@@ -769,7 +937,7 @@ def main(args=None):
                 print("generate started")
                 output_ids = model.generate(
                     inputs["input_ids"],
-                    max_new_tokens=20,
+                    max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                 )
             generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
@@ -838,6 +1006,49 @@ def main(args=None):
         else:
             print("\n=== Total Runtime ===")
             print(f"{total_elapsed:.2f} seconds")
+
+        if args.save_csv and records:
+            all_used_csv = set()
+            for r in records:
+                all_used_csv.update(r.get("used_gpu_idxs", []))
+            used_ordered_csv = sorted(all_used_csv)
+
+            csv_headers = ["stage", "time_s", "cpu_pct", "cores_used"]
+            for i in used_ordered_csv:
+                csv_headers += [f"gpu_{i}_pct", f"gpu_{i}_peak_mib"]
+            csv_headers += [
+                "max_new_tokens", "prompt", "prompt_token_len", "replace",
+            ]
+
+            replace_str = " ".join(args.replace) if args.replace else ""
+
+            with open(args.save_csv, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(csv_headers)
+                for r in records:
+                    row = [
+                        r["stage"],
+                        f"{r['time_s']:.4f}",
+                        (f"{r['sys_cpu_pct']:.1f}"
+                         if r.get("sys_cpu_pct") is not None else ""),
+                        (f"{r['cores_used']:.1f}"
+                         if r.get("cores_used") is not None else ""),
+                    ]
+                    gpu_pct = r.get("gpu_pct") or []
+                    gpu_mem = r.get("gpu_mem_mib") or []
+                    for i in used_ordered_csv:
+                        pct = gpu_pct[i] if i < len(gpu_pct) else None
+                        mem = gpu_mem[i] if i < len(gpu_mem) else None
+                        row.append(f"{pct:.1f}" if pct is not None else "")
+                        row.append(str(mem) if mem is not None else "")
+                    row += [
+                        args.max_new_tokens,
+                        prompt_text,
+                        prompt_token_len,
+                        replace_str,
+                    ]
+                    writer.writerow(row)
+            print(f"CSV saved to {args.save_csv}")
 
         return BenchmarkResult(perplexity=None, elapsed_time=total_elapsed)
 
