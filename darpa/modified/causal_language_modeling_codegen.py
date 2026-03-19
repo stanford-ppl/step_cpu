@@ -21,7 +21,7 @@ from typing import List, Dict
 import pathlib as _pathlib
 import torch
 
-_PROJECT_ROOT = str(_pathlib.Path(__file__).resolve().parents[2])  # mocha/
+_PROJECT_ROOT = str(_pathlib.Path(__file__).resolve().parents[1])  # mocha/
 
 from datasets import load_dataset
 from transformers import (
@@ -379,27 +379,29 @@ class GPT2MLPStepWrapper(torch.nn.Module):
         return out.reshape(shape)
 
 
-def _build_gpt2mlp_fused6():
-    """Compile the AVX512+OpenMP GPT2 MLP kernel from STeP programs via codegen."""
-    from step.avx_codegen import AVXCodegen
-    from step.compile import build_extension
-    from darpa.modified.step_kernels import (
+def _build_gpt2mlp_fused6(reuse_cached=False):
+    """Compile the SIMD+OpenMP GPT2 MLP kernel from STeP programs via codegen."""
+    from step.avx_codegen import AVXCodegen, ISA_PROFILES
+    from step.compile import build_extension, detect_isa
+    from step.step_kernels import (
         build_gpt2_mlp_gemv_program,
         build_gpt2_mlp_gemm_program,
     )
 
-    print("Building AVX512+OpenMP GPT2 MLP kernel from STeP programs...")
+    isa = detect_isa()
+    vl = ISA_PROFILES[isa]["VL"]
+    print(f"Building {isa.upper()}+OpenMP GPT2 MLP kernel from STeP programs...")
 
-    gemv = build_gpt2_mlp_gemv_program()
-    gemm = build_gpt2_mlp_gemm_program()
-    codegen = AVXCodegen(decode=gemv, prefill=gemm)
+    gemv = build_gpt2_mlp_gemv_program(vector_width=vl)
+    gemm = build_gpt2_mlp_gemm_program(vector_width=vl, gemm_n_register_block=2 if isa == "avx2" else 4)
+    codegen = AVXCodegen(decode=gemv, prefill=gemm, isa=isa)
     cpp_source = codegen.generate()
-    return build_extension(gemv.name, cpp_source, avx512=True)
+    return build_extension(gemv.name, cpp_source, isa=isa, reuse_cached=reuse_cached)
 
 
-def _apply_gpt2mlp_fused6(model):
+def _apply_gpt2mlp_fused6(model, reuse_cached=False):
     """Replace all transformer block MLPs with GPT2MLPStepWrapper using the tiled GEMV + Pade-tanh GELU kernel."""
-    compiled_kernel = _build_gpt2mlp_fused6()
+    compiled_kernel = _build_gpt2mlp_fused6(reuse_cached=reuse_cached)
     blocks = model.transformer.h
     for i, block in enumerate(blocks):
         block.mlp = GPT2MLPStepWrapper(block.mlp, compiled_kernel)
@@ -545,8 +547,8 @@ std::vector<torch::Tensor> gpt2_attn_codegen_step(
         V = torch::cat({past_value, V}, 2);
     }
 
-    auto present_key = has_past ? K.clone() : K;
-    auto present_value = has_past ? V.clone() : V;
+    auto present_key = K;
+    auto present_value = V;
 
     const int64_t total_len = K.size(2);
 
@@ -556,8 +558,8 @@ std::vector<torch::Tensor> gpt2_attn_codegen_step(
     float scale = 1.0f / std::sqrt((float)head_dim);
     scores.mul_(scale);
 
-    // 5. Causal mask (raw pointer, upper-triangle only)
-    {
+    // 5. Causal mask (raw pointer, upper-triangle only) — skip for single-token decode
+    if (S > 1) {
         auto causal = torch::zeros({S, total_len}, scores.options());
         float* mask_ptr = causal.data_ptr<float>();
         for (int64_t i = 0; i < S; i++) {
@@ -646,8 +648,8 @@ std::vector<torch::Tensor> gpt2_attn_step(
         V = torch::cat({past_value, V}, /*dim=*/2);
     }
 
-    auto present_key = has_past ? K.clone() : K;
-    auto present_value = has_past ? V.clone() : V;
+    auto present_key = K;
+    auto present_value = V;
 
     const int64_t total_len = K.size(2);
 
@@ -657,8 +659,8 @@ std::vector<torch::Tensor> gpt2_attn_step(
     float scale = 1.0f / std::sqrt((float)head_dim);
     scores.mul_(scale);
 
-    // 5. Causal mask (raw pointer, upper-triangle only)
-    {
+    // 5. Causal mask (raw pointer, upper-triangle only) — skip for single-token decode
+    if (S > 1) {
         auto causal = torch::zeros({S, total_len}, scores.options());
         float* mask_ptr = causal.data_ptr<float>();
         for (int64_t i = 0; i < S; i++) {
@@ -695,10 +697,10 @@ TORCH_LIBRARY_FRAGMENT(step_ops, m) {
     m.def("gpt2_attn_step", gpt2_attn_step);
 }
 """
-    return build_extension("gpt2_attn", cpp_source, avx512=False)
+    return build_extension("gpt2_attn", cpp_source)
 
 
-def _apply_gpt2attn(model):
+def _apply_gpt2attn(model, reuse_cached=False):
     """Replace all transformer block attentions with baseline GPT2AttentionStepWrapper."""
     compiled_kernel = _build_gpt2attn()
     blocks = model.transformer.h
@@ -707,28 +709,40 @@ def _apply_gpt2attn(model):
     print(f"Replaced {len(blocks)} GPT2Attention blocks with baseline C++ kernel.")
 
 
-def _build_gpt2attn_codegen():
-    """Compile the codegen'd AVX-512 GPT2Attention kernel from STeP programs."""
-    from step.avx_codegen import AVXCodegen
-    from step.compile import build_extension
-    from darpa.modified.step_kernels import (
+def _make_attn_entry_point(gemv_fn, gemm_fn):
+    """Produce the attention entry-point C++ with ISA-appropriate function names."""
+    return (_ATTN_ENTRY_POINT_CPP
+            .replace("avx512_omp_gemv", gemv_fn)
+            .replace("avx512_omp_gemm", gemm_fn))
+
+
+def _build_gpt2attn_codegen(reuse_cached=False):
+    """Compile the codegen'd SIMD GPT2Attention kernel from STeP programs."""
+    from step.avx_codegen import AVXCodegen, ISA_PROFILES
+    from step.compile import build_extension, detect_isa
+    from step.step_kernels import (
         build_gpt2_attn_gemv_program,
         build_gpt2_attn_gemm_program,
     )
 
-    print("Building codegen'd AVX-512 GPT2Attention kernel from STeP programs...")
+    isa = detect_isa()
+    vl = ISA_PROFILES[isa]["VL"]
+    print(f"Building codegen'd {isa.upper()} GPT2Attention kernel from STeP programs...")
 
-    gemv = build_gpt2_attn_gemv_program()
-    gemm = build_gpt2_attn_gemm_program()
-    codegen = AVXCodegen(decode=gemv, prefill=gemm)
+    gemv = build_gpt2_attn_gemv_program(vector_width=vl)
+    gemm = build_gpt2_attn_gemm_program(vector_width=vl, gemm_n_register_block=2 if isa == "avx2" else 4)
+    codegen = AVXCodegen(decode=gemv, prefill=gemm, isa=isa)
     kernel_cpp = codegen.generate_kernels_only(extra_includes=["#include <limits>"])
-    cpp_source = kernel_cpp + _ATTN_ENTRY_POINT_CPP
-    return build_extension("gpt2_attn_codegen", cpp_source, avx512=True)
+    entry_point = _make_attn_entry_point(
+        ISA_PROFILES[isa]["gemv_fn"], ISA_PROFILES[isa]["gemm_fn"]
+    )
+    cpp_source = kernel_cpp + entry_point
+    return build_extension("gpt2_attn_codegen", cpp_source, isa=isa, reuse_cached=reuse_cached)
 
 
-def _apply_gpt2attn_codegen(model):
+def _apply_gpt2attn_codegen(model, reuse_cached=False):
     """Replace all transformer block attentions with codegen'd GPT2AttentionStepWrapper."""
-    compiled_kernel = _build_gpt2attn_codegen()
+    compiled_kernel = _build_gpt2attn_codegen(reuse_cached=reuse_cached)
     blocks = model.transformer.h
     for i, block in enumerate(blocks):
         block.attn = GPT2AttentionStepWrapper(block.attn, compiled_kernel)
@@ -744,7 +758,7 @@ _REPLACEMENT_REGISTRY = {
 }
 
 
-def apply_replacements(model, replace_names):
+def apply_replacements(model, replace_names, reuse_cached=False):
     """Apply named submodule replacements. Call after model.eval(), before inference."""
     if not replace_names:
         return
@@ -754,7 +768,7 @@ def apply_replacements(model, replace_names):
             raise ValueError(
                 f"Unknown replacement: {name!r}. Known: {list(_REPLACEMENT_REGISTRY)}"
             )
-        fn(model)
+        fn(model, reuse_cached=reuse_cached)
 
 
 def parse_clm(args):
@@ -837,6 +851,11 @@ def parse_clm(args):
             "Target sequence length for inference; selects an ELI5 question "
             "with similar token count. Ignored if --prompt is also provided."
         ),
+    )
+    parser.add_argument(
+        "--reuse-cached",
+        action="store_true",
+        help="Reuse previously compiled STeP extensions if source unchanged.",
     )
     return parser.parse_args(args)
 
@@ -924,7 +943,7 @@ def main(args=None):
         if args.replace:
             print(f"\nApplying module replacements: {args.replace}")
             with TimerClass("apply_replacements", records):
-                apply_replacements(model, args.replace)
+                apply_replacements(model, args.replace, reuse_cached=args.reuse_cached)
         model.eval()
 
         with TimerClass("tokenize_prompt", records):

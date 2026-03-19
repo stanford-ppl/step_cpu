@@ -452,7 +452,7 @@ def _build_gemm_stage(
 # ============================================================
 
 
-def build_gpt2_mlp_gemv_program() -> StepProgram:
+def build_gpt2_mlp_gemv_program(vector_width: int = 16) -> StepProgram:
     """Build the StepProgram for the GPT2 MLP GEMV path (M=1).
 
     The MLP computes:
@@ -478,7 +478,7 @@ def build_gpt2_mlp_gemv_program() -> StepProgram:
     )
 
     # Stage 1: GEMV h = x[1,D] @ W_fc[D,K] + b_fc[K]
-    gemv1_n = IndexVar("n", size="K", step=16, parallelized=True, register_block=4)
+    gemv1_n = IndexVar("n", size="K", step=vector_width, parallelized=True, register_block=4)
     gemv1_k = IndexVar("k", size="D", step=1)
 
     gemv1_x = Buffer([gemv1_k], name="x")             # hidden_states: accessed as x[k], scalar
@@ -491,13 +491,13 @@ def build_gpt2_mlp_gemv_program() -> StepProgram:
     )
 
     # Stage 2: GELU h = gelu(h) in-place
-    gelu_k = IndexVar("k", size="K", step=16)
+    gelu_k = IndexVar("k", size="K", step=vector_width)
     gelu_buf = Buffer([gelu_k], name="h")
 
     program.stages.append(_build_gelu_stage(gelu_buf, gelu_k))
 
     # Stage 3: GEMV out = h[1,K] @ W_proj[K,D] + b_proj[D]
-    gemv2_n = IndexVar("n", size="D", step=16, parallelized=True, register_block=4)
+    gemv2_n = IndexVar("n", size="D", step=vector_width, parallelized=True, register_block=4)
     gemv2_k = IndexVar("k", size="K", step=1)
 
     gemv2_x = Buffer([gemv2_k], name="h")               # h[K]: accessed as x[k], scalar
@@ -512,7 +512,7 @@ def build_gpt2_mlp_gemv_program() -> StepProgram:
     return program
 
 
-def build_gpt2_mlp_gemm_program() -> StepProgram:
+def build_gpt2_mlp_gemm_program(vector_width: int = 16, gemm_n_register_block: int = 4) -> StepProgram:
     """Build the StepProgram for the GPT2 MLP GEMM path (M>1).
 
     The MLP computes:
@@ -541,7 +541,7 @@ def build_gpt2_mlp_gemm_program() -> StepProgram:
 
     # Stage 1: GEMM h[M,K] = A[M,D] @ W_fc[D,K] + b_fc[K]
     gemm1_m = IndexVar("m", size="M", step=1, parallelized=True, register_block=4)
-    gemm1_n = IndexVar("n", size="K", step=16, register_block=4)
+    gemm1_n = IndexVar("n", size="K", step=vector_width, register_block=gemm_n_register_block)
     gemm1_k = IndexVar("k", size="D", step=1)
 
     gemm1_a = Buffer([gemm1_m, gemm1_k], name="x")     # hidden_states[M,D]
@@ -558,14 +558,14 @@ def build_gpt2_mlp_gemm_program() -> StepProgram:
 
     # Stage 2: GELU h = gelu(h) in-place, parallelized over M
     gelu_m = IndexVar("m", size="M", step=1, parallelized=True)
-    gelu_k = IndexVar("k", size="K", step=16)
+    gelu_k = IndexVar("k", size="K", step=vector_width)
     gelu_buf = Buffer([gelu_m, gelu_k], name="h")
 
     program.stages.append(_build_gelu_stage(gelu_buf, gelu_k, m_var=gelu_m))
 
     # Stage 3: GEMM out[M,D] = h[M,K] @ W_proj[K,D] + b_proj[D]
     gemm2_m = IndexVar("m", size="M", step=1, parallelized=True, register_block=4)
-    gemm2_n = IndexVar("n", size="D", step=16, register_block=4)
+    gemm2_n = IndexVar("n", size="D", step=vector_width, register_block=gemm_n_register_block)
     gemm2_k = IndexVar("k", size="K", step=1)
 
     gemm2_a = Buffer([gemm2_m, gemm2_k], name="h")       # h[M,K]
@@ -588,7 +588,7 @@ def build_gpt2_mlp_gemm_program() -> StepProgram:
 # ============================================================
 
 
-def build_gpt2_attn_gemv_program() -> StepProgram:
+def build_gpt2_attn_gemv_program(vector_width: int = 16) -> StepProgram:
     """Build single-stage GEMV program for attention projections.
 
     A single GEMV stage: y[N] = x[K] @ W[K,N] + bias[N].
@@ -601,7 +601,7 @@ def build_gpt2_attn_gemv_program() -> StepProgram:
         dim_bindings={"D": ("x", 1), "N": ("W", 1)},
     )
 
-    n = IndexVar("n", size="N", step=16, parallelized=True, register_block=4)
+    n = IndexVar("n", size="N", step=vector_width, parallelized=True, register_block=4)
     k = IndexVar("k", size="D", step=1)
 
     x_buf = Buffer([k], name="x")
@@ -613,7 +613,7 @@ def build_gpt2_attn_gemv_program() -> StepProgram:
     return program
 
 
-def build_gpt2_attn_gemm_program() -> StepProgram:
+def build_gpt2_attn_gemm_program(vector_width: int = 16, gemm_n_register_block: int = 4) -> StepProgram:
     """Build single-stage GEMM program for attention projections.
 
     A single GEMM stage: C[M,N] = A[M,K] @ W[K,N] + bias[N].
@@ -627,7 +627,7 @@ def build_gpt2_attn_gemm_program() -> StepProgram:
     )
 
     m = IndexVar("m", size="M", step=1, parallelized=True, register_block=4)
-    n = IndexVar("n", size="N", step=16, register_block=4)
+    n = IndexVar("n", size="N", step=vector_width, register_block=gemm_n_register_block)
     k = IndexVar("k", size="D", step=1)
 
     a_buf = Buffer([m, k], name="x")
